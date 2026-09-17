@@ -1,0 +1,2145 @@
+diff --git a/hw/audio/Kconfig b/hw/audio/Kconfig
+index daf060e1be..a940493ec6 100644
+--- a/hw/audio/Kconfig
++++ b/hw/audio/Kconfig
+@@ -55,3 +55,9 @@ config VIRTIO_SND
+     bool
+     default y
+     depends on VIRTIO
++
++config MARVELL_88W8618
++    bool
++
++config SCREAMER
++    bool
+diff --git a/hw/audio/meson.build b/hw/audio/meson.build
+index 2990974449..e0c32f96c7 100644
+--- a/hw/audio/meson.build
++++ b/hw/audio/meson.build
+@@ -11,6 +11,7 @@ system_ss.add(when: 'CONFIG_MARVELL_88W8618', if_true: files('marvell_88w8618.c'
+ system_ss.add(when: 'CONFIG_PCSPK', if_true: files('pcspk.c'))
+ system_ss.add(when: 'CONFIG_PL041', if_true: files('pl041.c', 'lm4549.c'))
+ system_ss.add(when: 'CONFIG_SB16', if_true: files('sb16.c'))
++system_ss.add(when: 'CONFIG_SCREAMER', if_true: files('screamer.c'))
+ system_ss.add(when: 'CONFIG_VT82C686', if_true: files('via-ac97.c'))
+ system_ss.add(when: 'CONFIG_WM8750', if_true: files('wm8750.c'))
+ system_ss.add(when: ['CONFIG_VIRTIO_SND', 'CONFIG_VIRTIO'], if_true: files('virtio-snd.c'))
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+new file mode 100644
+index 0000000000..d983b6edc8
+--- /dev/null
++++ b/hw/audio/screamer.c
+@@ -0,0 +1,480 @@
++/*
++ * QEMU PowerMac Awacs Screamer device support
++ *
++ * Copyright (c) 2016 Mark Cave-Ayland
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include "qemu/osdep.h"
++#include "audio/audio.h"
++#include "hw/hw.h"
++#include "hw/irq.h"
++#include "audio/audio.h"
++#include "hw/audio/screamer.h"
++#include "hw/qdev-properties.h"
++#include "qemu/timer.h"
++#include "hw/ppc/mac_dbdma.h"
++#include "system/system.h"
++#include "qemu/cutils.h"
++#include "qemu/log.h"
++#include "qemu/typedefs.h"
++
++/* debug screamer */
++//#define DEBUG_SCREAMER
++
++#ifdef DEBUG_SCREAMER
++#define SCREAMER_DPRINTF(fmt, ...)                                  \
++    do { printf("SCREAMER: " fmt , ## __VA_ARGS__); } while (0)
++#else
++#define SCREAMER_DPRINTF(fmt, ...)
++#endif
++
++/* chip registers */
++#define SND_CTRL_REG   0x0
++#define CODEC_CTRL_REG 0x1
++#define CODEC_STAT_REG 0x2
++#define CLIP_CNT_REG   0x3
++#define BYTE_SWAP_REG  0x4
++#define FRAME_CNT_REG  0x5
++
++#define CODEC_CTRL_MASKECMD        (0x1 << 24)
++#define CODEC_CTRL1_RECALIBRATE    0x4
++
++#define CODEC_STAT_MANUFACTURER_CRYSTAL    0x100
++#define CODEC_STAT_AWACS_REVISION          0x3000
++#define CODEC_STAT_MASK_VALID              (0x1 << 22) 
++
++/* Audio */
++static const char *s_spk = "screamer";
++
++static void pmac_screamer_tx_transfer(ScreamerState *s)
++{
++    DBDMA_io *io = &s->io;
++    int samples;
++
++    samples = MIN(io->len >> s->shift, s->samples - s->wpos);
++    dma_memory_read(&address_space_memory, io->addr,
++                    &s->mixbuf[s->wpos << s->shift], samples << s->shift,
++                    MEMTXATTRS_UNSPECIFIED);
++
++    SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
++
++    io->addr += (samples << s->shift);
++    io->len -= (samples << s->shift);
++    s->wpos += samples;
++
++    /* Continue DBDMA if we have completed the transfer, otherwise defer */
++    if (io->len == 0) {
++        SCREAMER_DPRINTF("-> End of transfer\n");
++        io->dma_end(io);
++    }
++}
++
++static void pmac_screamer_tx(DBDMA_io *io)
++{
++    ScreamerState *s = io->opaque;
++
++    SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
++                     " len: %x\n", io->addr, io->len);
++
++    memcpy(&s->io, io, sizeof(DBDMA_io));
++    //if (s->wpos + (s->io.len >> s->shift) > s->samples) {
++    //    return;
++    //}
++
++    pmac_screamer_tx_transfer(s);
++}
++
++static void pmac_screamer_tx_flush(DBDMA_io *io)
++{
++    DBDMA_channel *ch = io->channel;
++    dbdma_cmd *current = &ch->current;
++    uint16_t cmd;
++
++    SCREAMER_DPRINTF("DMA TX flush!\n");
++#if 0
++    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
++    if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
++        cmd == INPUT_MORE || cmd == INPUT_LAST) {
++        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
++        current->res_count = cpu_to_le16(io->len);
++
++        dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
++                         &ch->current, sizeof(dbdma_cmd),
++                         MEMTXATTRS_UNSPECIFIED);
++    }
++#endif
++
++    ch->io.processing = false;
++
++    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
++    if (cmd == INPUT_MORE || cmd == INPUT_LAST) {
++        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
++        current->res_count = cpu_to_le16(io->len);
++
++            dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
++                         &ch->current, sizeof(dbdma_cmd),
++                         MEMTXATTRS_UNSPECIFIED);
++    }
++
++}
++
++static void pmac_screamer_rx(DBDMA_io *io)
++{
++    SCREAMER_DPRINTF("DMA RX transfer: addr %" HWADDR_PRIx
++                     " len: %x\n", io->addr, io->len);
++
++    //ScreamerState *s = io->opaque;
++    DBDMA_channel *ch = io->channel;
++        
++    /* FIXME: stop channel after updating with status to stop MacOS 9 freezing */
++    ch->regs[DBDMA_STATUS] &= ~RUN;
++
++    io->dma_end(io);
++}
++
++static void pmac_screamer_rx_flush(DBDMA_io *io)
++{
++    DBDMA_channel *ch = io->channel;
++    dbdma_cmd *current = &ch->current;
++    uint16_t cmd;
++
++    SCREAMER_DPRINTF("DMA RX flush!\n");
++#if 1
++    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
++    if (cmd == INPUT_MORE || cmd == INPUT_LAST) {
++        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
++        current->res_count = cpu_to_le16(io->len);
++
++        dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
++                         &ch->current, sizeof(dbdma_cmd),
++                         MEMTXATTRS_UNSPECIFIED);
++    }
++#endif
++}
++
++void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, int rxchannel)
++{
++    s->dbdma = dbdma;
++    DBDMA_register_channel(dbdma, txchannel, s->dma_tx_irq,
++                           pmac_screamer_tx, pmac_screamer_tx_flush, s);
++    DBDMA_register_channel(dbdma, rxchannel, s->dma_rx_irq,
++                           pmac_screamer_rx, pmac_screamer_rx_flush, s);
++}
++
++static void screamerspk_callback(void *opaque, int free_b)
++{
++    ScreamerState *s = opaque;
++    DBDMA_io *io = &s->io;
++    int samples, generated;
++
++    if (free_b == 0) {
++        return;
++    }
++
++    if (s->wpos - s->rpos == 0) {
++        return;
++    }
++
++    samples = MIN(s->samples, free_b >> s->shift);
++    generated = MIN(samples, s->wpos - s->rpos);
++
++    AUD_write(s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
++              generated << s->shift);
++
++    SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
++    
++    s->regs[FRAME_CNT_REG] += generated;
++    s->rpos += generated;
++    if (s->rpos < s->wpos) {
++        return;
++    }
++
++    s->wpos = 0;
++    s->rpos = 0;
++
++    if (io->len) {
++        DBDMA_channel *ch = io->channel;
++        uint32_t status = ch->regs[DBDMA_STATUS];
++
++        SCREAMER_DPRINTF("Continue deferred transfer\n");
++
++        /* Disable channel so we only complete the current transfer */
++        ch->regs[DBDMA_STATUS] &= ~RUN;
++
++        /* Perform deferred transfer */
++        pmac_screamer_tx_transfer(s);
++
++        /* Re-enable channel */
++        ch->regs[DBDMA_STATUS] = status;
++
++        /* Kick channel to continue */
++        DBDMA_kick(container_of(ch, DBDMAState, channels[ch->channel]));
++    }
++}
++
++static void screamer_update_settings(ScreamerState *s)
++{
++    struct audsettings as = { s->rate, 2, AUDIO_FORMAT_S16,
++        1 };
++
++    s->voice = AUD_open_out(&s->card, s->voice, s_spk, s, screamerspk_callback, &as);
++    if (!s->voice) {
++        AUD_log(s_spk, "Could not open voice\n");
++        return;
++    }
++
++    s->shift = 2;
++    s->samples = AUD_get_buffer_size_out(s->voice) >> s->shift;
++    s->mixbuf = g_malloc0(s->samples << s->shift);
++
++    AUD_set_active_out(s->voice, true);
++}
++
++static void screamer_update_volume(ScreamerState *s)
++{
++    uint8_t muted = s->codec_ctrl_regs[0x1] & 0x80 ? 1 : 0;
++    uint8_t att_left = (s->codec_ctrl_regs[0x4] & 0xf);
++    uint8_t att_right = (s->codec_ctrl_regs[0x4] & 0x3c0) >> 6;
++
++    SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
++                     muted, att_left, att_right);
++
++    AUD_set_volume_out(s->voice, muted, (0xf - att_left) << 4,
++                       (0xf - att_right) << 4);
++}
++
++static void screamer_reset(DeviceState *dev)
++{
++    ScreamerState *s = SCREAMER(dev);
++    
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->codec_ctrl_regs, 0, sizeof(s->codec_ctrl_regs));
++    memset(&s->io, 0, sizeof(DBDMA_io));
++
++    s->rate = 44100;
++    screamer_update_settings(s);
++
++    s->bpos = 0;
++    s->ppos = 0;
++
++    return;
++}
++
++static void screamer_realizefn(DeviceState *dev, Error **errp)
++{
++    ScreamerState *s = SCREAMER(dev);
++
++    if (!AUD_register_card(s_spk, &s->card, errp)) {
++        return;
++    }
++
++    s->rate = 44100;
++    screamer_update_settings(s);
++}
++
++static void screamer_control_write(ScreamerState *s, uint32_t val)
++{
++    SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
++        
++    /* Basic rate selection */
++    switch ((val & 0x700) >> 8) {
++    case 0x00:
++        s->rate = 44100;
++        break;
++    case 0x1:
++        s->rate = 29400;
++        break;
++    case 0x2:
++        s->rate = 22050;
++        break;
++    case 0x3:
++        s->rate = 17640;
++        break;
++    case 0x4:
++        s->rate = 14700;
++        break;
++    case 0x5:
++        s->rate = 11025;
++        break;
++    case 0x6:
++        s->rate = 8820;
++        break;
++    case 0x7:
++        s->rate = 7350;
++        break;
++    }
++
++    SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
++    screamer_update_settings(s);
++    
++    s->regs[0] = val;
++}
++
++static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
++{
++    //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
++
++    switch (addr) {
++    case 0x1:
++        /* Clear recalibrate if set */
++        val = val & ~CODEC_CTRL1_RECALIBRATE;    
++
++        /* Update volume in case mute set */
++        screamer_update_volume(s);
++        break;
++
++    case 0x4:
++        /* Speaker attenuation */
++        screamer_update_volume(s);
++        break;
++    }
++    
++    s->codec_ctrl_regs[addr] = val;
++}
++
++static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
++{
++    ScreamerState *s = opaque;
++    uint32_t val;
++
++    addr = addr >> 4;
++    switch (addr) {
++    case SND_CTRL_REG:
++        val = s->regs[addr];
++        break;
++    case CODEC_CTRL_REG:
++        val = s->regs[addr] & ~CODEC_CTRL_MASKECMD;
++        break;
++    case CODEC_STAT_REG:
++        if (s->codec_ctrl_regs[7] & 1) {
++            /* Read back mode */
++            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0xe];
++        } else {
++            /* Return status register */
++            val = s->regs[addr] & ~0xff00;
++            val |= CODEC_STAT_MANUFACTURER_CRYSTAL | CODEC_STAT_AWACS_REVISION |
++                   CODEC_STAT_MASK_VALID;
++        }
++        break;
++    case CLIP_CNT_REG:
++    case BYTE_SWAP_REG:
++    case FRAME_CNT_REG:
++        val = s->regs[addr];
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP,
++                  "screamer: Unimplemented register read "
++                  "reg 0x%" HWADDR_PRIx " size 0x%x\n",
++                  addr, size);
++        val = 0;
++        break;
++    }
++
++    SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " -> %x\n", __func__, addr, val);
++
++    return val;
++}
++
++static void screamer_write(void *opaque, hwaddr addr,
++                           uint64_t val, unsigned size)
++{
++    ScreamerState *s = opaque;
++    uint32_t codec_addr;
++
++    addr = addr >> 4;
++
++    SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " val %" PRIx64 "\n", __func__, addr, val);
++
++    switch (addr) {
++    case SND_CTRL_REG:
++        screamer_control_write(s, val & 0xffffffff);
++        break;
++    case CODEC_CTRL_REG:
++        s->regs[addr] = val & 0xffffffff;
++        codec_addr = (val & 0x7fff) >> 12;
++        screamer_codec_write(s, codec_addr, val & 0xfff);
++        break;
++    case CODEC_STAT_REG:
++    case CLIP_CNT_REG:
++    case BYTE_SWAP_REG:
++        s->regs[addr] = val & 0xffffffff;
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP,
++                  "screamer: Unimplemented register write "
++                  "reg 0x%" HWADDR_PRIx " size 0x%x value 0x%" PRIx64 "\n",
++                  addr, size, val);
++        break;
++    }
++
++    return;
++}
++
++static const MemoryRegionOps screamer_ops = {
++    .read = screamer_read,
++    .write = screamer_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    }
++};
++
++static void screamer_initfn(Object *obj)
++{
++    SysBusDevice *d = SYS_BUS_DEVICE(obj);
++    ScreamerState *s = SCREAMER(obj);
++
++    memory_region_init_io(&s->mem, obj, &screamer_ops, s, "screamer", 0x1000);
++    sysbus_init_mmio(d, &s->mem);
++    sysbus_init_irq(d, &s->irq);
++    sysbus_init_irq(d, &s->dma_tx_irq);
++    sysbus_init_irq(d, &s->dma_rx_irq);
++}
++
++static Property screamer_properties[] = {
++    DEFINE_AUDIO_PROPERTIES(ScreamerState, card),
++    { },
++};
++
++static void screamer_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = screamer_realizefn;
++    dc->legacy_reset = screamer_reset;
++    device_class_set_props_n(dc, screamer_properties, 1);
++}
++
++static const TypeInfo screamer_type_info = {
++    .name = TYPE_SCREAMER,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ScreamerState),
++    .instance_init = screamer_initfn,
++    .class_init = screamer_class_init,
++};
++
++static void screamer_register_types(void)
++{
++    type_register_static(&screamer_type_info);
++}
++
++type_init(screamer_register_types)
+diff --git a/hw/display/ati.c b/hw/display/ati.c
+index 864fa4fc2c..7b91029ffe 100644
+--- a/hw/display/ati.c
++++ b/hw/display/ati.c
+@@ -22,12 +22,12 @@
+ #include "vga-access.h"
+ #include "hw/qdev-properties.h"
+ #include "vga_regs.h"
++#include "qemu/bswap.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
+ #include "ui/console.h"
+-#include "hw/display/i2c-ddc.h"
+ #include "trace.h"
+ 
+ #define ATI_DEBUG_HW_CURSOR 0
+@@ -48,6 +48,19 @@ static const struct {
+ 
+ enum { VGA_MODE, EXT_MODE };
+ 
++static void ati_vga_set_offset(VGACommonState *vga, uint32_t offs)
++{
++    int bypp = DIV_ROUND_UP(vga->vbe_regs[VBE_DISPI_INDEX_BPP], BITS_PER_BYTE);
++
++    if (!bypp ||
++        vga->vbe_regs[VBE_DISPI_INDEX_YRES] *
++        vga->vbe_regs[VBE_DISPI_INDEX_VIRT_WIDTH] * bypp + offs >
++        vga->vbe_size) {
++        return;
++    }
++    vga->vbe_start_addr = offs / 4;
++}
++
+ static void ati_vga_switch_mode(ATIVGAState *s)
+ {
+     DPRINTF("%d -> %d\n",
+@@ -109,26 +122,12 @@ static void ati_vga_switch_mode(ATIVGAState *s)
+             vbe_ioport_write_data(&s->vga, 0, VBE_DISPI_ENABLED |
+                 VBE_DISPI_LFB_ENABLED | VBE_DISPI_NOCLEARMEM |
+                 (s->regs.dac_cntl & DAC_8BIT_EN ? VBE_DISPI_8BIT_DAC : 0));
+-            /* now set offset and stride after enable as that resets these */
++            /* now set offset and stride because enable resets these */
+             if (stride) {
+-                int bypp = DIV_ROUND_UP(bpp, BITS_PER_BYTE);
+-
+                 vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_VIRT_WIDTH);
+                 vbe_ioport_write_data(&s->vga, 0, stride);
+-                stride *= bypp;
+-                if (offs % stride) {
+-                    DPRINTF("CRTC offset is not multiple of pitch\n");
+-                    vbe_ioport_write_index(&s->vga, 0,
+-                                           VBE_DISPI_INDEX_X_OFFSET);
+-                    vbe_ioport_write_data(&s->vga, 0, offs % stride / bypp);
+-                }
+-                vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_Y_OFFSET);
+-                vbe_ioport_write_data(&s->vga, 0, offs / stride);
+-                DPRINTF("VBE offset (%d,%d), vbe_start_addr=%x\n",
+-                        s->vga.vbe_regs[VBE_DISPI_INDEX_X_OFFSET],
+-                        s->vga.vbe_regs[VBE_DISPI_INDEX_Y_OFFSET],
+-                        s->vga.vbe_start_addr);
+             }
++            ati_vga_set_offset(&s->vga, offs);
+         }
+     } else {
+         /* VGA mode enabled */
+@@ -141,27 +140,27 @@ static void ati_vga_switch_mode(ATIVGAState *s)
+ /* Used by host side hardware cursor */
+ static void ati_cursor_define(ATIVGAState *s)
+ {
+-    uint8_t data[1024];
++    uint64_t data[128];
+     uint32_t srcoff;
+-    int i, j, idx = 0;
+ 
+     if ((s->regs.cur_offset & BIT(31)) || s->cursor_guest_mode) {
+         return; /* Do not update cursor if locked or rendered by guest */
+     }
+     /* FIXME handle cur_hv_offs correctly */
+-    srcoff = s->regs.cur_offset -
+-        (s->regs.cur_hv_offs >> 16) - (s->regs.cur_hv_offs & 0xffff) * 16;
+-    for (i = 0; i < 64; i++) {
+-        for (j = 0; j < 8; j++, idx++) {
+-            data[idx] = vga_read_byte(&s->vga, srcoff + i * 16 + j);
+-            data[512 + idx] = vga_read_byte(&s->vga, srcoff + i * 16 + j + 8);
+-        }
++    srcoff = (s->regs.cur_offset & 0x07fffff0) - (s->regs.cur_hv_offs >> 16) -
++             (s->regs.cur_hv_offs & 0xffff) * 16;
++    if (srcoff > s->vga.vram_size - 64 * 16) {
++        return;
++    }
++    for (int i = 0; i < 64; i++, srcoff += 16) {
++        data[i] = ldq_le_p(&s->vga.vram_ptr[srcoff]);
++        data[i + 64] = ldq_le_p(&s->vga.vram_ptr[srcoff + 8]);
+     }
+     if (!s->cursor) {
+         s->cursor = cursor_alloc(64, 64);
+     }
+     cursor_set_mono(s->cursor, s->regs.cur_color1, s->regs.cur_color0,
+-                    &data[512], 1, &data[0]);
++                    (uint8_t *)&data[64], 1, (uint8_t *)&data[0]);
+     dpy_cursor_define(s->vga.con, s->cursor);
+ }
+ 
+@@ -177,13 +176,15 @@ static void ati_cursor_invalidate(VGACommonState *vga)
+     if (s->cursor_size != size ||
+         vga->hw_cursor_x != s->regs.cur_hv_pos >> 16 ||
+         vga->hw_cursor_y != (s->regs.cur_hv_pos & 0xffff) ||
+-        s->cursor_offset != s->regs.cur_offset - (s->regs.cur_hv_offs >> 16) -
++        s->cursor_offset != (s->regs.cur_offset & 0x07fffff0) -
++        (s->regs.cur_hv_offs >> 16) -
+         (s->regs.cur_hv_offs & 0xffff) * 16) {
+         /* Remove old cursor then update and show new one if needed */
+         vga_invalidate_scanlines(vga, vga->hw_cursor_y, vga->hw_cursor_y + 63);
+         vga->hw_cursor_x = s->regs.cur_hv_pos >> 16;
+         vga->hw_cursor_y = s->regs.cur_hv_pos & 0xffff;
+-        s->cursor_offset = s->regs.cur_offset - (s->regs.cur_hv_offs >> 16) -
++        s->cursor_offset = (s->regs.cur_offset & 0x07fffff0) -
++                           (s->regs.cur_hv_offs >> 16) -
+                            (s->regs.cur_hv_offs & 0xffff) * 16;
+         s->cursor_size = size;
+         if (size) {
+@@ -196,9 +197,9 @@ static void ati_cursor_invalidate(VGACommonState *vga)
+ static void ati_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
+ {
+     ATIVGAState *s = container_of(vga, ATIVGAState, vga);
+-    uint32_t srcoff;
++    uint32_t h, srcoff, color;
++    uint64_t abits, xbits, mask;
+     uint32_t *dp = (uint32_t *)d;
+-    int i, j, h;
+ 
+     if (!(s->regs.crtc_gen_cntl & CRTC2_CUR_EN) ||
+         scr_y < vga->hw_cursor_y || scr_y >= vga->hw_cursor_y + 64 ||
+@@ -207,28 +208,29 @@ static void ati_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
+     }
+     /* FIXME handle cur_hv_offs correctly */
+     srcoff = s->cursor_offset + (scr_y - vga->hw_cursor_y) * 16;
++    if (srcoff > s->vga.vram_size - 16) {
++        return;
++    }
+     dp = &dp[vga->hw_cursor_x];
+     h = ((s->regs.crtc_h_total_disp >> 16) + 1) * 8;
+-    for (i = 0; i < 8; i++) {
+-        uint32_t color;
+-        uint8_t abits = vga_read_byte(vga, srcoff + i);
+-        uint8_t xbits = vga_read_byte(vga, srcoff + i + 8);
+-        for (j = 0; j < 8; j++, abits <<= 1, xbits <<= 1) {
+-            if (abits & BIT(7)) {
+-                if (xbits & BIT(7)) {
+-                    color = dp[i * 8 + j] ^ 0xffffffff; /* complement */
+-                } else {
+-                    continue; /* transparent, no change */
+-                }
++    abits = ldq_be_p(&vga->vram_ptr[srcoff]);
++    xbits = ldq_be_p(&vga->vram_ptr[srcoff + 8]);
++    mask = BIT_ULL(63);
++    for (int i = 0; i < 64; i++, mask >>= 1) {
++        if (vga->hw_cursor_x + i >= h) {
++            return; /* end of screen, don't span to next line */
++        }
++        if (abits & mask) {
++            if (xbits & mask) {
++                color = dp[i] ^ 0xffffffff; /* complement */
+             } else {
+-                color = (xbits & BIT(7) ? s->regs.cur_color1 :
+-                                          s->regs.cur_color0) | 0xff000000;
++                continue; /* transparent, no change */
+             }
+-            if (vga->hw_cursor_x + i * 8 + j >= h) {
+-                return; /* end of screen, don't span to next line */
+-            }
+-            dp[i * 8 + j] = color;
++        } else {
++            color = (xbits & mask ? s->regs.cur_color1 :
++                                    s->regs.cur_color0) | 0xff000000;
+         }
++        dp[i] = color;
+     }
+ }
+ 
+@@ -265,7 +267,7 @@ static void ati_vga_vblank_irq(void *opaque)
+     ati_vga_update_irq(s);
+ }
+ 
+-static inline uint64_t ati_reg_read_offs(uint32_t reg, int offs,
++static inline uint32_t ati_reg_read_offs(uint32_t reg, int offs,
+                                          unsigned int size)
+ {
+     if (offs == 0 && size == 4) {
+@@ -278,7 +280,7 @@ static inline uint64_t ati_reg_read_offs(uint32_t reg, int offs,
+ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ATIVGAState *s = opaque;
+-    uint64_t val = 0;
++    uint32_t val = 0;
+ 
+     switch (addr) {
+     case MM_INDEX:
+@@ -360,7 +362,7 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+                                       PCI_BASE_ADDRESS_0, size) & 0xfffffff0;
+         break;
+     case CONFIG_APER_SIZE:
+-        val = s->vga.vram_size / 2;
++        val = memory_region_size(&s->linear_aper) / 2;
+         break;
+     case CONFIG_REG_1_BASE:
+         val = pci_default_read_config(&s->dev,
+@@ -384,14 +386,16 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+     case GUI_STAT:
+         val = 64; /* free CMDFIFO entries */
+         break;
+-    case CRTC_H_TOTAL_DISP:
+-        val = s->regs.crtc_h_total_disp;
++    case CRTC_H_TOTAL_DISP ... CRTC_H_TOTAL_DISP + 3:
++        val = ati_reg_read_offs(s->regs.crtc_h_total_disp,
++                                addr - CRTC_H_TOTAL_DISP, size);
+         break;
+     case CRTC_H_SYNC_STRT_WID:
+         val = s->regs.crtc_h_sync_strt_wid;
+         break;
+-    case CRTC_V_TOTAL_DISP:
+-        val = s->regs.crtc_v_total_disp;
++    case CRTC_V_TOTAL_DISP ... CRTC_V_TOTAL_DISP + 3:
++        val = ati_reg_read_offs(s->regs.crtc_v_total_disp,
++                                addr - CRTC_V_TOTAL_DISP, size);
+         break;
+     case CRTC_V_SYNC_STRT_WID:
+         val = s->regs.crtc_v_sync_strt_wid;
+@@ -437,7 +441,7 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+     case DST_PITCH:
+         val = s->regs.dst_pitch;
+         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+-            val &= s->regs.dst_tile << 16;
++            val |= s->regs.dst_tile << 16;
+         }
+         break;
+     case DST_WIDTH:
+@@ -459,7 +463,13 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+         val = s->regs.dst_y;
+         break;
+     case DP_GUI_MASTER_CNTL:
+-        val = s->regs.dp_gui_master_cntl;
++        /* DP_GUI_MASTER_CNTL aliases fields from DP_MIX and DP_DATATYPE */
++        val = s->regs.dp_gui_master_cntl |
++              ((s->regs.dp_datatype & DP_BRUSH_DATATYPE) >> 4) |
++              ((s->regs.dp_datatype & DP_DST_DATATYPE) << 8) |
++              ((s->regs.dp_datatype & DP_SRC_DATATYPE) >> 4) |
++              (s->regs.dp_mix & DP_ROP3) |
++              ((s->regs.dp_mix & DP_SRC_SOURCE) << 16);
+         break;
+     case SRC_OFFSET:
+         val = s->regs.src_offset;
+@@ -467,7 +477,7 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+     case SRC_PITCH:
+         val = s->regs.src_pitch;
+         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+-            val &= s->regs.src_tile << 16;
++            val |= s->regs.src_tile << 16;
+         }
+         break;
+     case DP_BRUSH_BKGD_CLR:
+@@ -507,7 +517,53 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
+         val |= s->regs.default_tile << 16;
+         break;
+     case DEFAULT_SC_BOTTOM_RIGHT:
+-        val = s->regs.default_sc_bottom_right;
++        val = s->regs.default_sc_right;
++        val |= s->regs.default_sc_bottom << 16;
++        break;
++    case SC_TOP:
++        val = s->regs.sc_top;
++        break;
++    case SC_LEFT:
++        val = s->regs.sc_left;
++        break;
++    case SC_BOTTOM:
++        val = s->regs.sc_bottom;
++        break;
++    case SC_RIGHT:
++        val = s->regs.sc_right;
++        break;
++    case SRC_SC_BOTTOM:
++        val = s->regs.src_sc_bottom;
++        break;
++    case SRC_SC_RIGHT:
++        val = s->regs.src_sc_right;
++        break;
++    case SC_TOP_LEFT:
++    case SC_BOTTOM_RIGHT:
++    case SRC_SC_BOTTOM_RIGHT:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "Read from write-only register 0x%x\n", (unsigned)addr);
++        break;
++    case PM4_BUFFER_OFFSET:
++        val = s->cce.buffer_offset;
++        break;
++    case PM4_BUFFER_CNTL:
++        val = s->cce.buffer_cntl;
++        break;
++    case PM4_BUFFER_DL_RPTR:
++        val = s->cce.rptr;
++        break;
++    case PM4_BUFFER_DL_WPTR:
++        val = s->cce.wptr;
++        break;
++    case PM4_STAT:
++        /*
++         * We drain the ring synchronously in ati_cce_process(), so from
++         * the guest's point of view the engine is always caught up and
++         * idle by the time it gets to check status: full FIFO free
++         * count, not busy, not GUI-active.
++         */
++        val = PM4_STAT_FIFOCNT_MASK;
+         break;
+     default:
+         break;
+@@ -529,8 +585,8 @@ static inline void ati_reg_write_offs(uint32_t *reg, int offs,
+     }
+ }
+ 
+-static void ati_mm_write(void *opaque, hwaddr addr,
+-                           uint64_t data, unsigned int size)
++void ati_mm_write(void *opaque, hwaddr addr,
++                    uint64_t data, unsigned int size)
+ {
+     ATIVGAState *s = opaque;
+ 
+@@ -586,6 +642,7 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+         ati_reg_write_offs(&s->regs.crtc_gen_cntl,
+                            addr - CRTC_GEN_CNTL, data, size);
+         if ((val & CRTC2_CUR_EN) != (s->regs.crtc_gen_cntl & CRTC2_CUR_EN)) {
++            ati_vga_switch_mode(s);
+             if (s->cursor_guest_mode) {
+                 s->vga.force_shadow = !!(s->regs.crtc_gen_cntl & CRTC2_CUR_EN);
+             } else {
+@@ -593,8 +650,8 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+                     ati_cursor_define(s);
+                 }
+                 dpy_mouse_set(s->vga.con, s->regs.cur_hv_pos >> 16,
+-                              s->regs.cur_hv_pos & 0xffff,
+-                              (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) != 0);
++                                       s->regs.cur_hv_pos & 0xffff,
++                                       (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) != 0);
+             }
+         }
+         if ((val & (CRTC2_EXT_DISP_EN | CRTC2_EN)) !=
+@@ -691,26 +748,35 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+     case CNFG_CNTL:
+         s->regs.config_cntl = data;
+         break;
+-    case CRTC_H_TOTAL_DISP:
+-        s->regs.crtc_h_total_disp = data & 0x07ff07ff;
++    case CRTC_H_TOTAL_DISP ... CRTC_H_TOTAL_DISP + 3:
++        ati_reg_write_offs(&s->regs.crtc_h_total_disp,
++                           addr - CRTC_H_TOTAL_DISP, data, size);
++        s->regs.crtc_h_total_disp &= 0x07ff07ff;
+         break;
+     case CRTC_H_SYNC_STRT_WID:
+         s->regs.crtc_h_sync_strt_wid = data & 0x17bf1fff;
+         break;
+-    case CRTC_V_TOTAL_DISP:
+-        s->regs.crtc_v_total_disp = data & 0x0fff0fff;
++    case CRTC_V_TOTAL_DISP ... CRTC_V_TOTAL_DISP + 3:
++        ati_reg_write_offs(&s->regs.crtc_v_total_disp,
++                           addr - CRTC_V_TOTAL_DISP, data, size);
++        s->regs.crtc_v_total_disp &= 0x0fff0fff;
+         break;
+     case CRTC_V_SYNC_STRT_WID:
+         s->regs.crtc_v_sync_strt_wid = data & 0x9f0fff;
+         break;
+     case CRTC_OFFSET:
+-        s->regs.crtc_offset = data & 0xc7ffffff;
++        s->regs.crtc_offset = data & 0x87fffff8;
++        ati_vga_set_offset(&s->vga, s->regs.crtc_offset & 0x07ffffff);
+         break;
+     case CRTC_OFFSET_CNTL:
+         s->regs.crtc_offset_cntl = data; /* FIXME */
+         break;
+     case CRTC_PITCH:
+-        s->regs.crtc_pitch = data & 0x07ff07ff;
++        data &= 0x07ff07ff;
++        if (s->regs.crtc_pitch != data) {
++            s->regs.crtc_pitch = data;
++            ati_vga_switch_mode(s);
++        }
+         break;
+     case 0xf00 ... 0xfff:
+         /* read-only copy of PCI config space so ignore writes */
+@@ -742,7 +808,7 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+         if (!s->cursor_guest_mode &&
+             (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) && !(t & BIT(31))) {
+             dpy_mouse_set(s->vga.con, s->regs.cur_hv_pos >> 16,
+-                          s->regs.cur_hv_pos & 0xffff, true);
++                                   s->regs.cur_hv_pos & 0xffff, true);
+         }
+         break;
+     }
+@@ -783,18 +849,12 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+         ati_cursor_define(s);
+         break;
+     case DST_OFFSET:
+-        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+             s->regs.dst_offset = data & 0xfffffff0;
+-        } else {
+-            s->regs.dst_offset = data & 0xfffffc00;
+-        }
+         break;
+     case DST_PITCH:
+-        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+             s->regs.dst_pitch = data & 0x3fff;
++        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+             s->regs.dst_tile = (data >> 16) & 1;
+-        } else {
+-            s->regs.dst_pitch = data & 0x3ff0;
+         }
+         break;
+     case DST_TILE:
+@@ -861,6 +921,25 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+         s->regs.dp_datatype = (data & 0x0f00) >> 8 | (data & 0x30f0) << 4 |
+                               (data & 0x4000) << 16;
+         s->regs.dp_mix = (data & GMC_ROP3_MASK) | (data & 0x7000000) >> 16;
++
++        if (!(data & GMC_SRC_PITCH_OFFSET_CNTL)) {
++            s->regs.src_offset = s->regs.default_offset;
++            s->regs.src_pitch = s->regs.default_pitch;
++        }
++        if (!(data & GMC_DST_PITCH_OFFSET_CNTL)) {
++            s->regs.dst_offset = s->regs.default_offset;
++            s->regs.dst_pitch = s->regs.default_pitch;
++        }
++        if (!(data & GMC_SRC_CLIPPING)) {
++            s->regs.src_sc_right = s->regs.default_sc_right;
++            s->regs.src_sc_bottom = s->regs.default_sc_bottom;
++        }
++        if (!(data & GMC_DST_CLIPPING)) {
++            s->regs.sc_top = 0;
++            s->regs.sc_left = 0;
++            s->regs.sc_right = s->regs.default_sc_right;
++            s->regs.sc_bottom = s->regs.default_sc_bottom;
++        }
+         break;
+     case DST_WIDTH_X:
+         s->regs.dst_x = data & 0x3fff;
+@@ -885,18 +964,12 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+         s->regs.dst_height = (data >> 16) & 0x3fff;
+         break;
+     case SRC_OFFSET:
+-        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+             s->regs.src_offset = data & 0xfffffff0;
+-        } else {
+-            s->regs.src_offset = data & 0xfffffc00;
+-        }
+         break;
+     case SRC_PITCH:
+-        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+             s->regs.src_pitch = data & 0x3fff;
++        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+             s->regs.src_tile = (data >> 16) & 1;
+-        } else {
+-            s->regs.src_pitch = data & 0x3ff0;
+         }
+         break;
+     case DP_BRUSH_BKGD_CLR:
+@@ -908,6 +981,12 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+     case DP_CNTL:
+         s->regs.dp_cntl = data;
+         break;
++    case DP_SRC_FRGD_CLR:
++        s->regs.dp_src_frgd_clr = data;
++        break;
++    case DP_SRC_BKGD_CLR:
++        s->regs.dp_src_bkgd_clr = data;
++        break;
+     case DP_DATATYPE:
+         s->regs.dp_datatype = data & 0xe0070f0f;
+         break;
+@@ -934,7 +1013,57 @@ static void ati_mm_write(void *opaque, hwaddr addr,
+         }
+         break;
+     case DEFAULT_SC_BOTTOM_RIGHT:
+-        s->regs.default_sc_bottom_right = data & 0x3fff3fff;
++        s->regs.default_sc_right = data & 0x3fff;
++        s->regs.default_sc_bottom = (data >> 16) & 0x3fff;
++        break;
++    case SC_TOP_LEFT:
++        s->regs.sc_left = data & 0x3fff;
++        s->regs.sc_top = (data >> 16) & 0x3fff;
++        break;
++    case SC_LEFT:
++        s->regs.sc_left = data & 0x3fff;
++        break;
++    case SC_TOP:
++        s->regs.sc_top = data & 0x3fff;
++        break;
++    case SC_BOTTOM_RIGHT:
++        s->regs.sc_right = data & 0x3fff;
++        s->regs.sc_bottom = (data >> 16) & 0x3fff;
++        break;
++    case SC_RIGHT:
++        s->regs.sc_right = data & 0x3fff;
++        break;
++    case SC_BOTTOM:
++        s->regs.sc_bottom = data & 0x3fff;
++        break;
++    case SRC_SC_BOTTOM_RIGHT:
++        s->regs.src_sc_right = data & 0x3fff;
++        s->regs.src_sc_bottom = (data >> 16) & 0x3fff;
++        break;
++    case SRC_SC_RIGHT:
++        s->regs.src_sc_right = data & 0x3fff;
++        break;
++    case SRC_SC_BOTTOM:
++        s->regs.src_sc_bottom = data & 0x3fff;
++        break;
++    case PM4_BUFFER_OFFSET:
++        s->cce.buffer_offset = data & 0x03fffff0;
++        break;
++    case PM4_BUFFER_CNTL:
++        s->cce.buffer_cntl = data;
++        break;
++    case PM4_BUFFER_DL_RPTR:
++        s->cce.rptr = data;
++        break;
++    case PM4_BUFFER_DL_WPTR:
++        s->cce.wptr = data;
++        ati_cce_process(s);
++        break;
++    case PM4_VC_FORMAT:
++        s->cce.vc_format = data;
++        break;
++    case PM4_VC_CNTL:
++        s->cce.vc_cntl = data;
+         break;
+     default:
+         break;
+@@ -951,6 +1080,7 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
+ {
+     ATIVGAState *s = ATI_VGA(dev);
+     VGACommonState *vga = &s->vga;
++    I2CBus *i2cbus;
+ 
+ #ifndef CONFIG_PIXMAN
+     if (s->use_pixman != 0) {
+@@ -998,11 +1128,10 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
+     }
+ 
+     /* ddc, edid */
+-    I2CBus *i2cbus = i2c_init_bus(DEVICE(s), "ati-vga.ddc");
++    i2cbus = i2c_init_bus(DEVICE(s), "ati-vga.ddc");
+     bitbang_i2c_init(&s->bbi2c, i2cbus);
+-    I2CSlave *i2cddc = I2C_SLAVE(qdev_new(TYPE_I2CDDC));
+-    i2c_slave_set_address(i2cddc, 0x50);
+-    qdev_realize_and_unref(DEVICE(i2cddc), BUS(i2cbus), &error_abort);
++    i2c_slave_set_address(I2C_SLAVE(&s->i2cddc), 0x50);
++    qdev_realize(DEVICE(&s->i2cddc), BUS(i2cbus), &error_abort);
+ 
+     /* mmio register space */
+     memory_region_init_io(&s->mm, OBJECT(s), &ati_mm_ops, s,
+@@ -1010,7 +1139,31 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
+     /* io space is alias to beginning of mmregs */
+     memory_region_init_alias(&s->io, OBJECT(s), "ati.io", &s->mm, 0, 0x100);
+ 
+-    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &vga->vram);
++    /*
++     * The framebuffer is at the beginning of the linear aperture. For
++     * Rage128 the upper half of the aperture is reserved for an AGP
++     * window (which we do not emulate.)
++     */
++    if (!s->linear_aper_sz) {
++        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
++            s->linear_aper_sz = ATI_RAGE128_LINEAR_APER_SIZE;
++        } else {
++            s->linear_aper_sz = ATI_R100_LINEAR_APER_SIZE;
++        }
++    }
++    if (s->linear_aper_sz > 256 * MiB) {
++        error_setg(errp, "x-linear-aper-size is too large (maximum 256 MiB)");
++        return;
++    }
++    if (s->linear_aper_sz < 16 * MiB) {
++        error_setg(errp, "x-linear-aper-size is too small (minimum 16 MiB)");
++        return;
++    }
++    memory_region_init(&s->linear_aper, OBJECT(dev), "ati-linear-aperture0",
++                       s->linear_aper_sz);
++    memory_region_add_subregion(&s->linear_aper, 0, &vga->vram);
++
++    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->linear_aper);
+     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
+     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mm);
+ 
+@@ -1029,6 +1182,11 @@ static void ati_vga_reset(DeviceState *dev)
+     /* reset vga */
+     vga_common_reset(&s->vga);
+     s->mode = VGA_MODE;
++
++    s->host_data.active = false;
++    s->host_data.next = 0;
++    s->host_data.row = 0;
++    s->host_data.col = 0;
+ }
+ 
+ static void ati_vga_exit(PCIDevice *dev)
+@@ -1047,6 +1205,8 @@ static const Property ati_vga_properties[] = {
+     DEFINE_PROP_BOOL("guest_hwcursor", ATIVGAState, cursor_guest_mode, false),
+     /* this is a debug option, prefer PROP_UINT over PROP_BIT for simplicity */
+     DEFINE_PROP_UINT8("x-pixman", ATIVGAState, use_pixman, DEFAULT_X_PIXMAN),
++    DEFINE_PROP_UINT64("x-linear-aper-size", ATIVGAState, linear_aper_sz, 0),
++    DEFINE_EDID_PROPERTIES(ATIVGAState, i2cddc.edid_info),
+ };
+ 
+ static void ati_vga_class_init(ObjectClass *klass, void *data)
+@@ -1069,6 +1229,9 @@ static void ati_vga_class_init(ObjectClass *klass, void *data)
+ 
+ static void ati_vga_init(Object *o)
+ {
++    ATIVGAState *s = ATI_VGA(o);
++
++    object_initialize_child(o, "edid", &s->i2cddc, TYPE_I2CDDC);
+     object_property_set_description(o, "x-pixman", "Use pixman for: "
+                                     "1: fill, 2: blit");
+ }
+diff --git a/hw/display/ati_int.h b/hw/display/ati_int.h
+index f5a47b82b0..a9a88f2a7b 100644
+--- a/hw/display/ati_int.h
++++ b/hw/display/ati_int.h
+@@ -10,8 +10,10 @@
+ #define ATI_INT_H
+ 
+ #include "qemu/timer.h"
++#include "qemu/units.h"
+ #include "hw/pci/pci_device.h"
+ #include "hw/i2c/bitbang_i2c.h"
++#include "hw/display/i2c-ddc.h"
+ #include "vga_int.h"
+ #include "qom/object.h"
+ 
+@@ -29,6 +31,10 @@
+ /* Radeon RV100 (VE) */
+ #define PCI_DEVICE_ID_ATI_RADEON_QY 0x5159
+ 
++#define ATI_RAGE128_LINEAR_APER_SIZE (64 * MiB)
++#define ATI_R100_LINEAR_APER_SIZE (128 * MiB)
++#define ATI_HOST_DATA_ACC_BITS 128
++
+ #define TYPE_ATI_VGA "ati-vga"
+ OBJECT_DECLARE_SIMPLE_TYPE(ATIVGAState, ATI_VGA)
+ 
+@@ -74,16 +80,57 @@ typedef struct ATIVGARegs {
+     uint32_t dp_brush_frgd_clr;
+     uint32_t dp_src_frgd_clr;
+     uint32_t dp_src_bkgd_clr;
++    uint16_t sc_top;
++    uint16_t sc_left;
++    uint16_t sc_bottom;
++    uint16_t sc_right;
++    uint16_t src_sc_bottom;
++    uint16_t src_sc_right;
+     uint32_t dp_cntl;
+     uint32_t dp_datatype;
+     uint32_t dp_mix;
+     uint32_t dp_write_mask;
+     uint32_t default_offset;
+     uint32_t default_pitch;
++    uint16_t default_sc_bottom;
++    uint16_t default_sc_right;
+     uint32_t default_tile;
+-    uint32_t default_sc_bottom_right;
+ } ATIVGARegs;
+ 
++/*
++ * CCE (Concurrent Command Engine) state. Rage128 hardware calls this the
++ * "PM4" engine in its own register names (see PM4_BUFFER_* etc in
++ * ati_regs.h) - "CCE" is ATI's driver/software-stack name for the same
++ * unit. This ring lives in the card's own VRAM and carries a packet
++ * stream in the type0/1/2/3 format shared with the later Radeon PM4
++ * engine (see ati_3d.c for packet layout, sourced from the open r128
++ * DRM/DRI driver headers).
++ *
++ * NOTE: this only supports the buffer-in-VRAM (PIO-style) operating
++ * mode. It does not yet implement the bus-mastering indirect-buffer
++ * mode (PM4_*BM* values of PM4_BUFFER_CNTL) where ring entries are
++ * pointers to command buffers in system/AGP memory fetched via DMA -
++ * that is the mode real OS drivers prefer for performance and is not
++ * wired up here yet.
++ */
++typedef struct ATICCEState {
++    uint32_t buffer_cntl;   /* raw PM4_BUFFER_CNTL, mode + size bits */
++    uint32_t buffer_offset; /* PM4_BUFFER_OFFSET: byte offset into VRAM */
++    uint32_t rptr;          /* PM4_BUFFER_DL_RPTR: dword index into ring */
++    uint32_t wptr;          /* PM4_BUFFER_DL_WPTR: dword index into ring */
++    /* Setup-engine state latched by packet0 writes, consumed by 3D pkts */
++    uint32_t vc_format;     /* PM4_VC_FORMAT: vertex format flags */
++    uint32_t vc_cntl;       /* PM4_VC_CNTL: prim type/walk/count */
++} ATICCEState;
++
++typedef struct ATIHostDataState {
++    bool active;
++    uint32_t row;
++    uint32_t col;
++    uint32_t next;
++    uint32_t acc[4];
++} ATIHostDataState;
++
+ struct ATIVGAState {
+     PCIDevice dev;
+     VGACommonState vga;
+@@ -97,13 +144,28 @@ struct ATIVGAState {
+     QEMUCursor *cursor;
+     QEMUTimer vblank_timer;
+     bitbang_i2c_interface bbi2c;
++    I2CDDCState i2cddc;
++    uint64_t linear_aper_sz;
++    MemoryRegion linear_aper;
+     MemoryRegion io;
+     MemoryRegion mm;
+     ATIVGARegs regs;
++    ATIHostDataState host_data;
++    ATICCEState cce;
+ };
+ 
+ const char *ati_reg_name(int num);
+ 
+ void ati_2d_blt(ATIVGAState *s);
++bool ati_host_data_flush(ATIVGAState *s);
++
++/* Exposed so ati_3d.c can dispatch decoded packet0/1 register writes
++ * through the same logic MMIO writes use, instead of duplicating it. */
++void ati_mm_write(void *opaque, hwaddr addr, uint64_t data, unsigned int size);
++
++/* ati_3d.c: CCE ring processing, called when the guest advances
++ * PM4_BUFFER_DL_WPTR (i.e. tells the card there are new commands). */
++void ati_cce_process(ATIVGAState *s);
++void ati_host_data_finish(ATIVGAState *s);
+ 
+ #endif /* ATI_INT_H */
+diff --git a/hw/display/ati_regs.h b/hw/display/ati_regs.h
+index d7127748ff..7365282928 100644
+--- a/hw/display/ati_regs.h
++++ b/hw/display/ati_regs.h
+@@ -151,6 +151,9 @@
+ #define PM4_FPU_DMAJOR02                        0x079c
+ #define PM4_FPU_STAT                            0x07a0
+ #define PM4_STAT                                0x07b8
++#define PM4_STAT_FIFOCNT_MASK                   0x00000fff
++#define PM4_STAT_BUSY                           (1 << 16)
++#define PM4_STAT_GUI_ACTIVE                     (1u << 31)
+ #define PM4_TEST_CNTL                           0x07d0
+ #define PM4_MICROCODE_ADDR                      0x07d4
+ #define PM4_MICROCODE_RADDR                     0x07d8
+@@ -252,6 +255,15 @@
+ #define DP_T12_CNTL                             0x178c
+ #define DST_BRES_T1_LNTH                        0x1790
+ #define DST_BRES_T2_LNTH                        0x1794
++#define HOST_DATA0                              0x17c0
++#define HOST_DATA1                              0x17c4
++#define HOST_DATA2                              0x17c8
++#define HOST_DATA3                              0x17cc
++#define HOST_DATA4                              0x17d0
++#define HOST_DATA5                              0x17d4
++#define HOST_DATA6                              0x17d8
++#define HOST_DATA7                              0x17dc
++#define HOST_DATA_LAST                          0x17e0
+ #define SCALE_SRC_HEIGHT_WIDTH                  0x1994
+ #define SCALE_OFFSET_0                          0x1998
+ #define SCALE_PITCH                             0x199c
+@@ -379,6 +391,94 @@
+ 
+ #define BUS_MASTER_DIS                          0x00000040
+ #define PM4_BUFFER_CNTL_NONPM4                  0x00000000
++/*
++ * PM4_BUFFER_CNTL mode field (bits 31:28). Real hardware supports mixed
++ * PIO/bus-master/vertex-cache ring configurations; only 192PIO (pure PIO,
++ * ring lives directly in VRAM) is implemented by ati_cce_process() so
++ * far. The BM-prefixed modes mean some or all ring entries are pointers
++ * to indirect command buffers fetched via DMA from system/AGP memory -
++ * not yet emulated.
++ */
++#define PM4_BUFFER_CNTL_MODE_MASK                0xf0000000
++#define PM4_BUFFER_CNTL_NONPM4_MODE              (0  << 28)
++#define PM4_BUFFER_CNTL_192PIO                   (1  << 28)
++#define PM4_BUFFER_CNTL_192BM                    (2  << 28)
++#define PM4_BUFFER_CNTL_128PIO_64INDBM           (3  << 28)
++#define PM4_BUFFER_CNTL_128BM_64INDBM            (4  << 28)
++#define PM4_BUFFER_CNTL_64PIO_128INDBM           (5  << 28)
++#define PM4_BUFFER_CNTL_64BM_128INDBM            (6  << 28)
++#define PM4_BUFFER_CNTL_64PIO_64VCBM_64INDBM     (7  << 28)
++#define PM4_BUFFER_CNTL_64BM_64VCBM_64INDBM      (8  << 28)
++#define PM4_BUFFER_CNTL_64PIO_64VCPIO_64INDPIO   (15 << 28)
++#define PM4_192PIO_RING_DWORDS                   192
++
++/* CCE packet header format (type in top 2 bits of the header dword) */
++#define CCE_PACKET_TYPE_MASK                     0xc0000000
++#define CCE_PACKET0                              0x00000000
++#define CCE_PACKET1                              0x40000000
++#define CCE_PACKET2                              0x80000000
++#define CCE_PACKET3                              0xc0000000
++#define CCE_PACKET0_ONE_REG_WR                   0x00008000
++#define CCE_PACKET_COUNT_MASK                    0x3fff0000
++#define CCE_PACKET0_REG_MASK                     0x000007ff
++#define CCE_PACKET1_REG0_MASK                    0x000007ff
++#define CCE_PACKET1_REG1_MASK                    0x003ff800
++
++/* Packet3 opcodes, extracted as (header >> 8) & 0xff */
++#define CCE_PACKET3_OP_NOP                       0x10
++#define CCE_PACKET3_OP_PAINT                     0x11
++#define CCE_PACKET3_OP_BITBLT                    0x12
++#define CCE_PACKET3_OP_SMALLTEXT                 0x13
++#define CCE_PACKET3_OP_HOSTDATA_BLT              0x14
++#define CCE_PACKET3_OP_POLYLINE                  0x15
++#define CCE_PACKET3_OP_SCALING                   0x16
++#define CCE_PACKET3_OP_TRANS_SCALING             0x17
++#define CCE_PACKET3_OP_POLYSCANLINES             0x18
++#define CCE_PACKET3_OP_NEXT_CHAR                 0x19
++#define CCE_PACKET3_OP_PAINT_MULTI               0x1a
++#define CCE_PACKET3_OP_BITBLT_MULTI              0x1b
++#define CCE_PACKET3_OP_PLY_NEXTSCAN              0x1d
++#define CCE_PACKET3_OP_SET_SCISSORS              0x1e
++#define CCE_PACKET3_OP_SET_MODE24BPP             0x1f
++#define CCE_PACKET3_OP_3D_SAVE_CONTEXT           0x20
++#define CCE_PACKET3_OP_3D_PLAY_CONTEXT           0x21
++#define CCE_PACKET3_OP_3D_RNDR_GEN_INDX_PRIM     0x23
++#define CCE_PACKET3_OP_3D_RNDR_GEN_PRIM          0x25
++#define CCE_PACKET3_OP_LOAD_PALETTE              0x2c
++#define CCE_PACKET3_OP_PURGE                     0x2d
++#define CCE_PACKET3_OP_NEXT_VERTEX_BUNDLE        0x2e
++/* CNTL_* variants of the 2D ops above carry an extra leading state dword
++ * and are encoded with bit 0x80 set relative to their base opcode. */
++#define CCE_PACKET3_OP_CNTL_BIT                  0x80
++
++/* PM4_VC_FORMAT: vertex format flags (which per-vertex fields are
++ * present and in what order in the vertex stream) */
++#define CCE_VC_FRMT_RHW                          0x00000001
++#define CCE_VC_FRMT_DIFFUSE_BGR                  0x00000002
++#define CCE_VC_FRMT_DIFFUSE_A                    0x00000004
++#define CCE_VC_FRMT_DIFFUSE_ARGB                 0x00000008
++#define CCE_VC_FRMT_SPEC_BGR                     0x00000010
++#define CCE_VC_FRMT_SPEC_F                       0x00000020
++#define CCE_VC_FRMT_SPEC_FRGB                    0x00000040
++#define CCE_VC_FRMT_S_T                          0x00000080
++#define CCE_VC_FRMT_S2_T2                        0x00000100
++#define CCE_VC_FRMT_RHW2                         0x00000200
++
++/* PM4_VC_CNTL: primitive type/walk mode/vertex count for a 3D draw */
++#define CCE_VC_CNTL_PRIM_TYPE_MASK               0x0000000f
++#define CCE_VC_CNTL_PRIM_TYPE_NONE               0x00000000
++#define CCE_VC_CNTL_PRIM_TYPE_POINT               0x00000001
++#define CCE_VC_CNTL_PRIM_TYPE_LINE                0x00000002
++#define CCE_VC_CNTL_PRIM_TYPE_POLY_LINE           0x00000003
++#define CCE_VC_CNTL_PRIM_TYPE_TRI_LIST            0x00000004
++#define CCE_VC_CNTL_PRIM_TYPE_TRI_FAN             0x00000005
++#define CCE_VC_CNTL_PRIM_TYPE_TRI_STRIP           0x00000006
++#define CCE_VC_CNTL_PRIM_TYPE_TRI_TYPE2           0x00000007
++#define CCE_VC_CNTL_PRIM_WALK_MASK                0x00000030
++#define CCE_VC_CNTL_PRIM_WALK_IND                 0x00000010
++#define CCE_VC_CNTL_PRIM_WALK_LIST                0x00000020
++#define CCE_VC_CNTL_PRIM_WALK_RING                0x00000030
++#define CCE_VC_CNTL_NUM_SHIFT                     16
+ 
+ /* DP_DATATYPE bit constants */
+ #define DST_8BPP                                0x00000002
+@@ -386,6 +486,13 @@
+ #define DST_16BPP                               0x00000004
+ #define DST_24BPP                               0x00000005
+ #define DST_32BPP                               0x00000006
++#define DP_DST_DATATYPE                         0x0000000f
++#define DP_BRUSH_DATATYPE                       0x00000f00
++#define SRC_MONO_FRGD_BKGD                      0x00000000
++#define SRC_MONO_FRGD                           0x00010000
++#define SRC_COLOR                               0x00030000
++#define DP_SRC_DATATYPE                         0x00030000
++#define DP_BYTE_PIX_ORDER                       0x40000000
+ 
+ #define BRUSH_SOLIDCOLOR                        0x00000d00
+ 
+@@ -394,6 +501,8 @@
+ #define GMC_DST_PITCH_OFFSET_CNTL               0x00000002
+ #define GMC_SRC_CLIP_DEFAULT                    0x00000000
+ #define GMC_DST_CLIP_DEFAULT                    0x00000000
++#define GMC_SRC_CLIPPING                        0x00000004
++#define GMC_DST_CLIPPING                        0x00000008
+ #define GMC_BRUSH_SOLIDCOLOR                    0x000000d0
+ #define GMC_SRC_DSTCOLOR                        0x00003000
+ #define GMC_BYTE_ORDER_MSB_TO_LSB               0x00000000
+@@ -437,6 +546,8 @@
+ #define DP_SRC_RECT                             0x00000200
+ #define DP_SRC_HOST                             0x00000300
+ #define DP_SRC_HOST_BYTEALIGN                   0x00000400
++#define DP_SRC_SOURCE                           0x00000700
++#define DP_ROP3                                 0x00ff0000
+ 
+ /* LVDS_GEN_CNTL constants */
+ #define LVDS_BL_MOD_LEVEL_MASK                  0x0000ff00
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 90e6c041bd..a35eb0dbde 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -59,7 +59,7 @@ system_ss.add(when: 'CONFIG_XLNX_DISPLAYPORT', if_true: files('xlnx_dp.c'))
+ 
+ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
+ 
+-system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
++system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_3d.c', 'ati_dbg.c'), pixman])
+ 
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
+diff --git a/hw/intc/openpic.c b/hw/intc/openpic.c
+index 78a82d0d30..2f479c23dd 100644
+--- a/hw/intc/openpic.c
++++ b/hw/intc/openpic.c
+@@ -1580,12 +1580,12 @@ static void openpic_realize(DeviceState *dev, Error **errp)
+         opp->irq_tim0 = KEYLARGO_TMR_IRQ;
+         opp->brr1 = -1;
+         opp->mpic_mode_mask = GCR_MODE_MIXED;
+-
++#if 0
+         if (opp->nb_cpus != 1) {
+             error_setg(errp, "Only UP supported today");
+             return;
+         }
+-
++#endif
+         map_list(opp, list_le, &list_count);
+         break;
+     }
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index ec0fa5aa9f..97548b6790 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -58,6 +58,7 @@ config MACIO
+     select MAC_DBDMA
+     select MAC_NVRAM
+     select MOS6522
++    select UNIMP
+ 
+ config IVSHMEM_DEVICE
+     bool
+diff --git a/hw/misc/macio/cuda.c b/hw/misc/macio/cuda.c
+index 34731ae560..f90f9df684 100644
+--- a/hw/misc/macio/cuda.c
++++ b/hw/misc/macio/cuda.c
+@@ -28,6 +28,7 @@
+ #include "hw/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "hw/misc/macio/cuda.h"
++#include "hw/i2c/i2c.h"
+ #include "qemu/timer.h"
+ #include "system/runstate.h"
+ #include "system/rtc.h"
+@@ -367,6 +368,86 @@ static bool cuda_cmd_set_time(CUDAState *s,
+     return true;
+ }
+ 
++static bool cuda_cmd_get_set_iic(CUDAState *s,
++                                 const uint8_t *in_data, int in_len,
++                                 uint8_t *out_data, int *out_len)
++{
++    int i;
++
++    qemu_log_mask(LOG_UNIMP, "CUDA: unimplemented GET_SET_IIC %s 0x%x %d\n",
++                  (in_data[0] & 1 ? "read" : "write"), in_data[0] >> 1,
++                  in_len);
++    if (i2c_start_transfer(s->i2c_bus, in_data[0] >> 1, in_data[0] & 1)) {
++        return false;
++    }
++    for (i = 0; i < in_len - 3; i++) {
++        if (i2c_send(s->i2c_bus, in_data[i])) {
++            i2c_end_transfer(s->i2c_bus);
++            return false;
++        }
++    }
++    return true;
++}
++
++static int i2c_send_recv(I2CBus *bus, uint8_t *data, bool recv)
++{
++    if (recv) {
++        *data = i2c_recv(bus);
++        return 0;
++    } else {
++        return i2c_send(bus, *data);
++    }
++}
++
++static bool cuda_cmd_combined_iic(CUDAState *s,
++                                  const uint8_t *in_data, int in_len,
++                                  uint8_t *out_data, int *out_len)
++{
++    int i;
++
++    if (in_len < 3) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "CUDA: COMBINED_FORMAT_IIC too few input bytes\n");
++        return false;
++    }
++    if ((in_data[0] & 0xfe) != (in_data[2] & 0xfe)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "CUDA: COMBINED_FORMAT_IIC address mismatch\n");
++        return false;
++    }
++
++    uint8_t data = in_data[1];
++    if (i2c_start_transfer(s->i2c_bus, in_data[0] >> 1, in_data[0] & 1) ||
++        i2c_send_recv(s->i2c_bus, &data, in_data[0] & 1)) {
++        return false;
++    }
++    i2c_end_transfer(s->i2c_bus);
++    if (in_data[2] & 1) {
++        if (i2c_start_transfer(s->i2c_bus, in_data[2] >> 1, in_data[2] & 1)) {
++            i2c_end_transfer(s->i2c_bus);
++            return false;
++        }
++        for (i = 0; i < 5; i++) {
++            if (i2c_send_recv(s->i2c_bus, &out_data[i], in_data[2] & 1)) {
++                i2c_end_transfer(s->i2c_bus);
++                return false;
++            }
++        }
++        *out_len = i;
++        i2c_end_transfer(s->i2c_bus);
++    } else {
++        for (i = 0; i < in_len - 3; i++) {
++            data = in_data[3 + i];
++            if (i2c_send_recv(s->i2c_bus, &data, in_data[2] & 1)) {
++                i2c_end_transfer(s->i2c_bus);
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++
+ static const CudaCommand handlers[] = {
+     { CUDA_AUTOPOLL, "AUTOPOLL", cuda_cmd_autopoll },
+     { CUDA_SET_AUTO_RATE, "SET_AUTO_RATE",  cuda_cmd_set_autorate },
+@@ -379,6 +460,8 @@ static const CudaCommand handlers[] = {
+       cuda_cmd_set_power_message },
+     { CUDA_GET_TIME, "GET_TIME", cuda_cmd_get_time },
+     { CUDA_SET_TIME, "SET_TIME", cuda_cmd_set_time },
++	{ CUDA_GET_SET_IIC, "GET_SET_IIC", cuda_cmd_get_set_iic },
++    { CUDA_COMBINED_FORMAT_IIC, "COMBINED_FORMAT_IIC", cuda_cmd_combined_iic },
+ };
+ 
+ static void cuda_receive_packet(CUDAState *s,
+@@ -544,14 +627,18 @@ static void cuda_init(Object *obj)
+     CUDAState *s = CUDA(obj);
+     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+ 
++ 	DeviceState *dev = DEVICE(obj);
++
+     object_initialize_child(obj, "mos6522-cuda", &s->mos6522_cuda,
+                             TYPE_MOS6522_CUDA);
+ 
+     memory_region_init_io(&s->mem, obj, &mos6522_cuda_ops, s, "cuda", 0x2000);
+     sysbus_init_mmio(sbd, &s->mem);
+ 
+-    qbus_init(&s->adb_bus, sizeof(s->adb_bus), TYPE_ADB_BUS,
+-              DEVICE(obj), "adb.0");
++    //qbus_init(&s->adb_bus, sizeof(s->adb_bus), TYPE_ADB_BUS,
++    //          DEVICE(obj), "adb.0");
++	qbus_init(&s->adb_bus, sizeof(s->adb_bus), TYPE_ADB_BUS, dev, "adb.0");
++	s->i2c_bus = i2c_init_bus(dev, "i2c");
+ }
+ 
+ static const Property cuda_properties[] = {
+diff --git a/hw/misc/macio/gpio.c b/hw/misc/macio/gpio.c
+index e87bfca1f5..341abe2f2b 100644
+--- a/hw/misc/macio/gpio.c
++++ b/hw/misc/macio/gpio.c
+@@ -80,7 +80,36 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
+             qemu_irq_lower(s->gpio_extirqs[gpio]);
+         }
+         break;
+-
++    case 4:
++        /* Active low, CPU1 reset */
++        if (!state) {
++            trace_macio_gpio_irq_assert(gpio);
++            qemu_irq_raise(s->gpio_extirqs[gpio]);
++        } else {
++            trace_macio_gpio_irq_deassert(gpio);
++            qemu_irq_lower(s->gpio_extirqs[gpio]);
++        }
++        break;
++    case 5:
++        /* Active low, CPU2 reset */
++        if (!state) {
++            trace_macio_gpio_irq_assert(gpio);
++            qemu_irq_raise(s->gpio_extirqs[gpio]);
++        } else {
++            trace_macio_gpio_irq_deassert(gpio);
++            qemu_irq_lower(s->gpio_extirqs[gpio]);
++        }
++        break;
++    case 6:
++        /* Active low, CPU3 reset */
++        if (!state) {
++            trace_macio_gpio_irq_assert(gpio);
++            qemu_irq_raise(s->gpio_extirqs[gpio]);
++        } else {
++            trace_macio_gpio_irq_deassert(gpio);
++            qemu_irq_lower(s->gpio_extirqs[gpio]);
++        }
++        break;
+     case 9:
+         /* Edge, triggered by NMI below */
+         if (state) {
+@@ -120,7 +149,28 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+             ibit = s->gpio_regs[addr] & IN_DATA;
+         }
+ 
+-        s->gpio_regs[addr] = value | ibit;
++        if (addr == 4) {
++            if (!(value & OUT_ENABLE)) {
++                ibit = 1; /* high unless driven low */
++            }
++	}
++        macio_set_gpio(s, addr, ibit);
++
++        if (addr == (KL_GPIO_RESET_CPU1 - KEYLARGO_GPIO_EXTINT_0)) {
++            /* For CPU1 reset: (0x58+0x04) - 0x58 = 0x04 */
++            if (!(value & OUT_ENABLE)) {
++                ibit = 1; /* Ensure pulled high unless driven low */
++            }
++            macio_set_gpio(s, 4, ibit);
++        } else if (addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
++            /* For CPU2 reset: (0x58+0x0f) - 0x58 = 0x0F */
++            macio_set_gpio(s, 5, ibit);
++        } else if (addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
++            /* For CPU3 reset: (0x58+0x10) - 0x58 = 0x10 */
++            macio_set_gpio(s, 6, ibit);
++        } else {
++            s->gpio_regs[addr] = value | ibit;
++        }
+     }
+ }
+ 
+@@ -186,6 +236,9 @@ static void macio_gpio_reset(DeviceState *dev)
+ 
+     /* GPIO 1 is up by default */
+     macio_set_gpio(s, 1, true);
++    macio_set_gpio(s, 4, true);
++    macio_set_gpio(s, 5, true);
++    macio_set_gpio(s, 6, true);
+ }
+ 
+ static void macio_gpio_nmi(NMIState *n, int cpu_index, Error **errp)
+diff --git a/hw/misc/macio/macio.c b/hw/misc/macio/macio.c
+index 194b152eff..c0aa85ead3 100644
+--- a/hw/misc/macio/macio.c
++++ b/hw/misc/macio/macio.c
+@@ -34,6 +34,7 @@
+ #include "hw/char/escc.h"
+ #include "hw/misc/macio/macio.h"
+ #include "hw/intc/heathrow_pic.h"
++#include "hw/misc/unimp.h"
+ #include "trace.h"
+ 
+ #define ESCC_CLOCK 3686400
+@@ -94,6 +95,14 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
+ {
+     MacIOState *s = MACIO(d);
+     SysBusDevice *sbd;
++    DeviceState *dev = qdev_new(TYPE_UNIMPLEMENTED_DEVICE);
++
++    qdev_prop_set_string(dev, "name", "macio-unimp");
++    qdev_prop_set_uint64(dev, "size", memory_region_size(&s->bar));
++    sbd = SYS_BUS_DEVICE(dev);
++    sysbus_realize_and_unref(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(&s->bar, 0,
++                                        sysbus_mmio_get_region(sbd, 0), -1000);
+ 
+     if (!qdev_realize(DEVICE(&s->dbdma), BUS(&s->macio_bus), errp)) {
+         return false;
+@@ -102,6 +111,13 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
+     memory_region_add_subregion(&s->bar, 0x08000,
+                                 sysbus_mmio_get_region(sbd, 0));
+ 
++    if (!qdev_realize(DEVICE(&s->screamer), BUS(&s->macio_bus), errp)) {
++        return false;
++    }
++    sbd = SYS_BUS_DEVICE(&s->screamer);
++    memory_region_add_subregion(&s->bar, 0x14000,
++                                sysbus_mmio_get_region(sbd, 0));
++
+     qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
+     qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
+     qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
+@@ -110,7 +126,6 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
+     if (!qdev_realize(DEVICE(&s->escc), BUS(&s->macio_bus), errp)) {
+         return false;
+     }
+-
+     macio_bar_setup(s);
+     pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
+ 
+@@ -191,6 +206,13 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
+                            0x1a, errp)) {
+         return;
+     }
++    
++    /* Screamer */
++    sbd = SYS_BUS_DEVICE(&s->screamer);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_IRQ));
++    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_DMA_IRQ));
++    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_RX_IRQ));
++    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
+ }
+ 
+ static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
+@@ -344,6 +366,13 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
+         memory_region_add_subregion(&s->bar, 0x16000,
+                                     sysbus_mmio_get_region(sbd, 0));
+     }
++
++    /* Screamer */
++    sbd = SYS_BUS_DEVICE(&s->screamer);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_IRQ));
++    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_DMA_IRQ));
++    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_RX_IRQ));
++    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
+ }
+ 
+ static void macio_newworld_init(Object *obj)
+@@ -373,6 +402,8 @@ static void macio_instance_init(Object *obj)
+     object_initialize_child(obj, "dbdma", &s->dbdma, TYPE_MAC_DBDMA);
+ 
+     object_initialize_child(obj, "escc", &s->escc, TYPE_ESCC);
++
++    object_initialize_child(obj, "screamer", &s->screamer, TYPE_SCREAMER);
+ }
+ 
+ static const VMStateDescription vmstate_macio_oldworld = {
+diff --git a/hw/nvram/mac_nvram.c b/hw/nvram/mac_nvram.c
+index 0d82e5a128..3ef53d26ca 100644
+--- a/hw/nvram/mac_nvram.c
++++ b/hw/nvram/mac_nvram.c
+@@ -46,7 +46,7 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
+     MacIONVRAMState *s = opaque;
+ 
+     addr = (addr >> s->it_shift) & (s->size - 1);
+-    trace_macio_nvram_write(addr, value);
++//    trace_macio_nvram_write(addr, value);
+     s->data[addr] = value;
+     if (s->blk) {
+         if (blk_pwrite(s->blk, addr, 1, &s->data[addr], 0) < 0) {
+@@ -64,7 +64,7 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
+ 
+     addr = (addr >> s->it_shift) & (s->size - 1);
+     value = s->data[addr];
+-    trace_macio_nvram_read(addr, value);
++//    trace_macio_nvram_read(addr, value);
+ 
+     return value;
+ }
+diff --git a/hw/ppc/Kconfig b/hw/ppc/Kconfig
+index ced6bbc740..a3243a1ebd 100644
+--- a/hw/ppc/Kconfig
++++ b/hw/ppc/Kconfig
+@@ -127,6 +127,7 @@ config MAC_OLDWORLD
+     select HEATHROW_PIC
+     select MACIO
+     select FW_CFG_PPC
++    select SCREAMER
+ 
+ config MAC_NEWWORLD
+     bool
+@@ -142,6 +143,7 @@ config MAC_NEWWORLD
+     select MAC_PMU
+     select UNIN_PCI
+     select FW_CFG_PPC
++    select SCREAMER
+ 
+ config E500
+     bool
+diff --git a/hw/ppc/mac_newworld.c b/hw/ppc/mac_newworld.c
+index 2d5309d6f5..5d5dbd9ba4 100644
+--- a/hw/ppc/mac_newworld.c
++++ b/hw/ppc/mac_newworld.c
+@@ -73,6 +73,7 @@
+ #include "kvm_ppc.h"
+ #include "hw/usb.h"
+ #include "hw/sysbus.h"
++#include "hw/irq.h"
+ #include "trace.h"
+ 
+ #define MAX_IDE_BUS 2
+@@ -128,12 +129,26 @@ static void ppc_core99_reset(void *opaque)
+     cpu->env.nip = PROM_BASE + 0x100;
+ }
+ 
++static void cpu_kick(void *opaque, int n, int level)
++{
++    PowerPCCPU *cpu = opaque;
++    CPUState *cs = CPU(cpu);
++
++    nanosleep((const struct timespec[]){{0, 500000000L}}, NULL);
++    if (level) {
++        cpu->env.excp_prefix = 0;
++        cpu_reset(cs);
++        ppc_cpu_do_system_reset(cs);
++    }
++}
++
+ /* PowerPC Mac99 hardware initialisation */
+ static void ppc_core99_init(MachineState *machine)
+ {
+     Core99MachineState *core99_machine = CORE99_MACHINE(machine);
+     MachineClass *mc = MACHINE_GET_CLASS(machine);
+-    PowerPCCPU *cpu = NULL;
++    qemu_irq kick;
++    PowerPCCPU **cpus = NULL;
+     CPUPPCState *env = NULL;
+     char *filename;
+     IrqLines *openpic_irqs;
+@@ -157,14 +172,23 @@ static void ppc_core99_init(MachineState *machine)
+     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
+ 
+     /* init CPUs */
++    cpus = g_new0(PowerPCCPU *, machine->smp.cpus);
+     for (i = 0; i < machine->smp.cpus; i++) {
+-        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
+-        env = &cpu->env;
+-
++        cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
++fprintf(stderr, "cpus[%d] = %p %p\n", i, (void *)cpus[i], (void *)&cpus[i]->env);
++        /* Secondary CPUs start halted */
++        object_property_set_bool(OBJECT(cpus[i]), "start-powered-off", i != 0,
++                                 &error_abort);
+         /* Set time-base frequency to 100 Mhz */
+-        cpu_ppc_tb_init(env, TBFREQ);
+-        qemu_register_reset(ppc_core99_reset, cpu);
++        cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
++        qemu_register_reset(ppc_core99_reset, cpus[i]);
++        env = &cpus[i]->env;
++        if(env)
++	 env->spr_cb[SPR_PIR].default_value = i;
+     }
++    env = &cpus[0]->env;
++
++
+ 
+     /* allocate RAM */
+     if (machine->ram_size > 2 * GiB) {
+@@ -251,8 +275,8 @@ static void ppc_core99_init(MachineState *machine)
+     }
+ 
+     openpic_irqs = g_new0(IrqLines, machine->smp.cpus);
+-    dev = DEVICE(cpu);
+     for (i = 0; i < machine->smp.cpus; i++) {
++        dev = DEVICE(cpus[i]);
+         /* Mac99 IRQ connection between OpenPIC outputs pins
+          * and PowerPC input pins
+          */
+@@ -364,13 +388,39 @@ static void ppc_core99_init(MachineState *machine)
+     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
+     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
+ 
++    pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
++    qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
++
+     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+ 
+-    pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
++    s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
++    for (i = 1; i < machine->smp.cpus; i++) {
++        kick = qemu_allocate_irq(cpu_kick, cpus[i], i);
++        sysbus_connect_irq(s, 4, kick);
++    }
++
+     for (i = 0; i < 4; i++) {
+         qdev_connect_gpio_out(uninorth_pci_dev, i,
+                               qdev_get_gpio_in(pic_dev, 0x1b + i));
+     }
++    
++    s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
++    if (machine->smp.cpus > 1) {
++        /* CPU1 reset: use GPIO 4 */
++        kick = qemu_allocate_irq(cpu_kick, cpus[1], 1);
++        sysbus_connect_irq(s, 4, kick);
++    }
++    if (machine->smp.cpus > 2) {
++        /* CPU2 reset: use GPIO 5 */
++        kick = qemu_allocate_irq(cpu_kick, cpus[2], 2);
++        sysbus_connect_irq(s, 5, kick);
++    }
++    if (machine->smp.cpus > 3) {
++        /* CPU3 reset: use GPIO 6 */
++        kick = qemu_allocate_irq(cpu_kick, cpus[3], 3);
++        sysbus_connect_irq(s, 6, kick);
++    }
++
+ 
+     /* TODO: additional PCI buses only wired up for 32-bit machines */
+     if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
+@@ -571,7 +621,7 @@ static void core99_machine_class_init(ObjectClass *oc, void *data)
+     mc->init = ppc_core99_init;
+     mc->block_default_type = IF_IDE;
+     /* SMP is not supported currently */
+-    mc->max_cpus = 1;
++    mc->max_cpus = 4;
+     mc->default_boot_order = "cd";
+     mc->default_display = "std";
+     mc->default_nic = "sungem";
+diff --git a/hw/ppc/mac_oldworld.c b/hw/ppc/mac_oldworld.c
+index b5814690f5..885203c374 100644
+--- a/hw/ppc/mac_oldworld.c
++++ b/hw/ppc/mac_oldworld.c
+@@ -34,6 +34,7 @@
+ #include "hw/input/adb.h"
+ #include "system/system.h"
+ #include "net/net.h"
++#include "hw/i2c/smbus_eeprom.h"
+ #include "hw/isa/isa.h"
+ #include "hw/pci/pci.h"
+ #include "hw/pci/pci_host.h"
+@@ -108,6 +109,9 @@ static void ppc_heathrow_init(MachineState *machine)
+     void *fw_cfg;
+     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
+ 
++	uint8_t *spd_data[3] = {};
++    I2CBus *i2c_bus;
++
+     /* init CPUs */
+     for (i = 0; i < machine->smp.cpus; i++) {
+         cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
+@@ -127,6 +131,16 @@ static void ppc_heathrow_init(MachineState *machine)
+ 
+     memory_region_add_subregion(get_system_memory(), 0, machine->ram);
+ 
++    for (i = 0; i < ARRAY_SIZE(spd_data); i++) {
++        int size_left = machine->ram_size - i * 512 * MiB;
++        if (size_left > 0) {
++            uint32_t sz = size_left / MiB;
++            sz = (sz > 512 ? 512 : sz);
++            sz = 1U << (31 - clz32(sz));
++            spd_data[i] = spd_data_generate(SDR, sz * MiB);
++        }
++    }
++
+     /* allocate and load firmware ROM */
+     memory_region_init_rom(bios, NULL, "ppc_heathrow.bios", PROM_SIZE,
+                            &error_fatal);
+@@ -284,6 +298,13 @@ static void ppc_heathrow_init(MachineState *machine)
+ 
+     /* MacIO CUDA/ADB */
+     dev = DEVICE(object_resolve_path_component(macio, "cuda"));
++    i2c_bus = I2C_BUS(qdev_get_child_bus(dev, "i2c"));
++    for (i = 0; i < ARRAY_SIZE(spd_data); i++) {
++        if (spd_data[i]) {
++            smbus_eeprom_init_one(i2c_bus, 0x50 + i, spd_data[i]);
++        }
++    }
++
+     adb_bus = qdev_get_child_bus(dev, "adb.0");
+     dev = qdev_new(TYPE_ADB_KEYBOARD);
+     qdev_realize_and_unref(dev, adb_bus, &error_fatal);
+diff --git a/include/hw/audio/screamer.h b/include/hw/audio/screamer.h
+new file mode 100644
+index 0000000000..b6c1fefb2b
+--- /dev/null
++++ b/include/hw/audio/screamer.h
+@@ -0,0 +1,69 @@
++/*
++ * QEMU PowerMac Awacs Screamer device support
++ *
++ * Copyright (c) 2016 Mark Cave-Ayland
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#ifndef HW_AUDIO_SCREAMER_H
++#define HW_AUDIO_SCREAMER_H
++
++#include "qemu/osdep.h"
++#include "hw/sysbus.h"
++#include "hw/ppc/mac_dbdma.h"
++#include "audio/audio.h"
++
++#define TYPE_SCREAMER "screamer"
++OBJECT_DECLARE_SIMPLE_TYPE(ScreamerState, SCREAMER)
++
++#define SCREAMER_BUFFER_SIZE 0x4000
++
++struct ScreamerState {
++    /*< private >*/
++    SysBusDevice parent_obj;
++
++    /*< public >*/
++    MemoryRegion mem;
++    qemu_irq irq;
++    void *dbdma;
++    qemu_irq dma_tx_irq;
++    qemu_irq dma_rx_irq;
++
++    QEMUSoundCard card;
++    SWVoiceOut *voice;
++    uint8_t *mixbuf;
++    int samples;
++    int shift;
++
++    uint32_t wpos;
++    uint32_t rpos;
++
++    uint32_t bpos;
++    uint32_t ppos;
++    uint32_t rate;
++    DBDMA_io io;
++
++    uint32_t regs[6];
++    uint32_t codec_ctrl_regs[8];
++};
++
++void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, int rxchannel);
++
++#endif
+diff --git a/include/hw/misc/macio/cuda.h b/include/hw/misc/macio/cuda.h
+index 8a6678c749..6385bea821 100644
+--- a/include/hw/misc/macio/cuda.h
++++ b/include/hw/misc/macio/cuda.h
+@@ -80,6 +80,7 @@ struct CUDAState {
+ 
+     ADBBusState adb_bus;
+     MOS6522CUDAState mos6522_cuda;
++    I2CBus *i2c_bus;
+ 
+     uint32_t tick_offset;
+     uint64_t tb_frequency;
+diff --git a/include/hw/misc/macio/gpio.h b/include/hw/misc/macio/gpio.h
+index 7d2aa886c2..cb7f0f5076 100644
+--- a/include/hw/misc/macio/gpio.h
++++ b/include/hw/misc/macio/gpio.h
+@@ -30,6 +30,20 @@
+ #include "hw/sysbus.h"
+ #include "qom/object.h"
+ 
++/* Linux/KeyLargo definitions for GPIO reset and extint lines */
++#define KEYLARGO_GPIO_EXTINT_0        0x58
++#define KEYLARGO_GPIO_0               0x50   /* if needed for extint calculations */
++
++#define KL_GPIO_EXTINT_CPU1           (KEYLARGO_GPIO_0 + 0x0a)
++#define KL_GPIO_EXTINT_CPU1_ASSERT    0x04
++#define KL_GPIO_EXTINT_CPU1_RELEASE   0x38
++
++#define KL_GPIO_RESET_CPU0            (KEYLARGO_GPIO_EXTINT_0 + 0x03)
++#define KL_GPIO_RESET_CPU1            (KEYLARGO_GPIO_EXTINT_0 + 0x04)
++#define KL_GPIO_RESET_CPU2            (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
++#define KL_GPIO_RESET_CPU3            (KEYLARGO_GPIO_EXTINT_0 + 0x10)
++
++
+ #define TYPE_MACIO_GPIO "macio-gpio"
+ OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
+ 
+diff --git a/include/hw/misc/macio/macio.h b/include/hw/misc/macio/macio.h
+index 16aa95b876..c806fb5f6a 100644
+--- a/include/hw/misc/macio/macio.h
++++ b/include/hw/misc/macio/macio.h
+@@ -36,6 +36,7 @@
+ #include "hw/nvram/mac_nvram.h"
+ #include "hw/ppc/mac_dbdma.h"
+ #include "hw/ppc/openpic.h"
++#include "hw/audio/screamer.h"
+ #include "qom/object.h"
+ 
+ /* Old World IRQs */
+@@ -46,6 +47,9 @@
+ #define OLDWORLD_IDE0_DMA_IRQ  0x2
+ #define OLDWORLD_IDE1_IRQ      0xe
+ #define OLDWORLD_IDE1_DMA_IRQ  0x3
++#define OLDWORLD_SCREAMER_TX_IRQ  0x11
++#define OLDWORLD_SCREAMER_TX_DMA_IRQ 0x08
++#define OLDWORLD_SCREAMER_RX_IRQ  0x09
+ 
+ /* New World IRQs */
+ #define NEWWORLD_CUDA_IRQ      0x19
+@@ -58,6 +62,9 @@
+ #define NEWWORLD_IDE1_DMA_IRQ  0x3
+ #define NEWWORLD_EXTING_GPIO1  0x2f
+ #define NEWWORLD_EXTING_GPIO9  0x37
++#define NEWWORLD_SCREAMER_IRQ  0x18
++#define NEWWORLD_SCREAMER_DMA_IRQ 0x09
++#define NEWWORLD_SCREAMER_RX_IRQ 0x0a
+ 
+ /* MacIO virtual bus */
+ #define TYPE_MACIO_BUS "macio-bus"
+@@ -112,6 +119,7 @@ struct MacIOState {
+     PMUState pmu;
+     DBDMAState dbdma;
+     ESCCState escc;
++    ScreamerState screamer;
+     uint64_t frequency;
+ };
+ 
+@@ -140,6 +148,7 @@ struct NewWorldMacIOState {
+     bool has_pmu;
+     bool has_adb;
+     OpenPICState pic;
++
+     MACIOIDEState ide[2];
+     MacIOGPIOState gpio;
+ };
+diff --git a/target/ppc/helper_regs.c b/target/ppc/helper_regs.c
+index f211bc9830..a3c693155b 100644
+--- a/target/ppc/helper_regs.c
++++ b/target/ppc/helper_regs.c
+@@ -725,7 +725,7 @@ void register_high_BATs(CPUPPCState *env)
+ #endif
+ }
+ 
+-/* Softare table search registers */
++/* Software table search registers */
+ void register_6xx_7xx_soft_tlb(CPUPPCState *env, int nb_tlbs, int nb_ways)
+ {
+ #if !defined(CONFIG_USER_ONLY)
