@@ -60,6 +60,25 @@ typedef struct ATIVGARegs {
     uint32_t misc_3d_state;     /* 0x1ca0 MISC_3D_STATE_CNTL_REG */
     uint32_t setup_cntl;        /* 0x1bc4 SETUP_CNTL - winding/ST-mode/etc */
     uint32_t vc_fpu_setup;      /* 0x071c PM4_VC_FPU_SETUP - front dir, cull */
+    /*
+     * The 3D context has its OWN destination pitch/offset (0x1c80,
+     * DST_PITCH_OFFSET_C) separate from the 2D engine's (0x142c,
+     * DST_PITCH_OFFSET). They are programmed independently and to
+     * different values - in one Tux Racer capture 0x1c80 was written
+     * 10704 times with a 2560-byte pitch at 0x312000 while 0x142c was
+     * written 2353 times with a 4096-byte pitch at 0x8000. Sharing one
+     * pair of globals meant every 2D blit clobbered the 3D render target
+     * and every 3D draw clobbered the blit destination, so whichever
+     * engine ran last decided where the other one wrote.
+     */
+    uint32_t dst_offset_3d;
+    uint32_t dst_pitch_3d;
+    uint32_t dst_tile_3d;
+
+    uint32_t z_offset;           /* 0x1c90 Z_OFFSET_C */
+    uint32_t z_pitch;            /* 0x1c94 Z_PITCH_C */
+    uint32_t z_sten_cntl;        /* 0x1c98 Z_STEN_CNTL_C */
+
     uint32_t sec_tex_cntl;       /* 0x1d00 SEC_TEX_CNTL_C */
     uint32_t sec_tex_combine;    /* 0x1d04 SEC_TEX_COMBINE_CNTL_C */
     uint32_t sec_tex_offset;     /* 0x1d08 SEC_TEX_0_OFFSET_C */
@@ -250,6 +269,19 @@ struct ATIVGAState {
     ATIHostDataState host_data;
     ATICCEState cce;
     ATITexLoc tex_loc_cache[ATI_TEX_LOC_CACHE_SIZE];
+
+    /*
+     * Video-memory regions the 2D engine treats as display surfaces,
+     * learned from blit traffic. A texture upload landing in one of these
+     * is sharing an address with a framebuffer, so it must not be recorded
+     * as a texture location - reading it back returns presented frame
+     * content instead of texels.
+     */
+    struct {
+        uint32_t base;
+        uint32_t span;
+    } display_surf[8];
+    unsigned display_surf_next;
 };
 
 const char *ati_reg_name(int num);
@@ -272,6 +304,8 @@ void ati_cce_fifo_write(ATIVGAState *s, uint32_t data);
 /* ati_3d.c: fetch and execute an indirect command buffer, triggered by a
  * write to PM4_IW_INDSIZE. */
 void ati_cce_exec_indirect(ATIVGAState *s, uint32_t dwords);
+void ati_2d_note_surface(ATIVGAState *s, uint32_t off, unsigned pitch,
+                         unsigned w, unsigned h);
 void ati_host_data_finish(ATIVGAState *s);
 
 #endif /* ATI_INT_H */

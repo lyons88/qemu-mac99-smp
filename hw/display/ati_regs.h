@@ -308,6 +308,22 @@
 #define PRIM_TEXTURE_COMBINE_CNTL_C             0x1cb4
 #define TEX_SIZE_PITCH_C                        0x1cb8
 #define PRIM_TEX_0_OFFSET_C                     0x1cbc
+#define Z_OFFSET_C                               0x1c90
+#define Z_PITCH_C                                0x1c94
+#define Z_PITCH_MASK                             0x0000ffff
+#define Z_STEN_CNTL_C                            0x1c98
+#define Z_PIX_WIDTH_SHIFT                        1
+#define Z_PIX_WIDTH_MASK                         (3 << 1)
+#define Z_PIX_WIDTH_16                           (0 << 1)
+#define Z_PIX_WIDTH_24                           (1 << 1)
+#define Z_PIX_WIDTH_32                           (2 << 1)
+#define Z_TEST_SHIFT                             4
+#define Z_TEST_MASK                              (7 << 4)
+
+/* TEX_CNTL_C bits that gate the depth unit. */
+#define TEX_CNTL_Z_ENABLE                        (1 << 0)
+#define TEX_CNTL_Z_WRITE_ENABLE                  (1 << 1)
+
 #define SEC_TEX_CNTL_C                           0x1d00
 #define SEC_SELECT_SEC_ST                        (1 << 0)
 #define SEC_TEX_COMBINE_CNTL_C                   0x1d04

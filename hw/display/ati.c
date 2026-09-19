@@ -938,17 +938,50 @@ void ati_mm_write(void *opaque, hwaddr addr,
         }
         break;
     case DST_PITCH_OFFSET:
-    case DST_PITCH_OFFSET_C:
+    case DST_PITCH_OFFSET_C: {
+        uint32_t off, pitch, tile;
+
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
-            s->regs.dst_offset = (data & 0x1fffff) << 5;
-            s->regs.dst_pitch = (data & 0x7fe00000) >> 21;
-            s->regs.dst_tile = data >> 31;
+            off = (data & 0x1fffff) << 5;
+            pitch = (data & 0x7fe00000) >> 21;
+            tile = data >> 31;
         } else {
-            s->regs.dst_offset = (data & 0x3fffff) << 10;
-            s->regs.dst_pitch = (data & 0x3fc00000) >> 16;
-            s->regs.dst_tile = data >> 30;
+            off = (data & 0x3fffff) << 10;
+            pitch = (data & 0x3fc00000) >> 16;
+            tile = data >> 30;
+        }
+        /*
+         * Keep the two contexts apart. DST_PITCH_OFFSET_C belongs to the
+         * 3D setup engine and DST_PITCH_OFFSET to the 2D engine; they are
+         * distinct registers the guest programs independently, so folding
+         * both into one pair of fields let each engine overwrite the
+         * other's render target.
+         */
+        /*
+         * DST_PITCH_OFFSET_C is the CCE context register, not a 3D-only
+         * one: 2D blits issued through the command stream (BITBLT_MULTI)
+         * program it and then blit, so it must keep feeding the shared 2D
+         * state. Routing it away from dst_offset/dst_pitch broke every
+         * CCE-driven blit.
+         *
+         * It additionally keeps a private copy for the 3D rasterizer. The
+         * shared fields are still overwritten by plain MMIO writes to
+         * DST_PITCH_OFFSET (0x142c) - which Tux Racer does 2353 times with
+         * the screen's 4096-byte pitch while the 3D target is 2560 - and
+         * that clobbering is what sheared the rendered image. The private
+         * copy is only updated from _C, so it survives.
+         */
+        s->regs.dst_offset = off;
+        s->regs.dst_pitch = pitch;
+        s->regs.dst_tile = tile;
+
+        if (addr == DST_PITCH_OFFSET_C) {
+            s->regs.dst_offset_3d = off;
+            s->regs.dst_pitch_3d = pitch;
+            s->regs.dst_tile_3d = tile;
         }
         break;
+    }
     case SRC_Y_X:
         s->regs.src_x = data & 0x3fff;
         s->regs.src_y = (data >> 16) & 0x3fff;
@@ -1096,6 +1129,15 @@ void ati_mm_write(void *opaque, hwaddr addr,
     case MISC_3D_STATE_CNTL_REG_C:
         s->regs.misc_3d_state = data;
         break;
+    case Z_OFFSET_C:
+        s->regs.z_offset = data;
+        break;
+    case Z_PITCH_C:
+        s->regs.z_pitch = data;
+        break;
+    case Z_STEN_CNTL_C:
+        s->regs.z_sten_cntl = data;
+        break;
     case SEC_TEX_CNTL_C:
         s->regs.sec_tex_cntl = data;
         break;
@@ -1159,8 +1201,17 @@ void ati_mm_write(void *opaque, hwaddr addr,
         break;
     case PM4_IW_INDSIZE:
         /*
-         * Length in dwords - and the trigger. Writing INDSIZE is what makes
-         * the engine fetch and execute the buffer INDOFF points at.
+         * Length in dwords, and the trigger: writing INDSIZE makes the
+         * engine fetch and execute the buffer INDOFF points at.
+         *
+         * Passed through unmasked. Earlier attempts to mask or strip bits
+         * here - a flat 12-bit field, then clearing the top set bit - both
+         * truncated real work. glxgears submits buffers of 0x1470 (5232)
+         * dwords; stripping pow2floor(5232) executes only 1136 of them,
+         * which left it drawing one gear instead of three. The kernel
+         * panic those masks were chasing had a different cause entirely
+         * (texture uploads DMAing over the driver's command buffers), and
+         * the size cap inside ati_cce_exec_indirect is guard enough.
          */
         ati_cce_exec_indirect(s, data);
         break;
@@ -1179,10 +1230,24 @@ void ati_mm_write(void *opaque, hwaddr addr,
         s->cce.buffer_cntl = data;
         break;
     case PM4_BUFFER_DL_RPTR:
-        s->cce.rptr = data;
+        /* Same as the write pointer below: low bits only, bit 31 is a flag. */
+        s->cce.rptr = (data & 0x3fffff) % PM4_192PIO_RING_DWORDS;
         break;
     case PM4_BUFFER_DL_WPTR:
-        s->cce.wptr = data;
+        /*
+         * Only the low bits are the ring position; bit 31 is a flag, not
+         * part of the pointer. The driver writes 0x80000000 here (six
+         * times in one Tux Racer capture, alongside seven writes of 0)
+         * when tearing the engine down. Storing it verbatim made
+         * ati_cce_process() walk from rptr toward a write pointer of
+         * 2147483648, decoding megabytes of unrelated memory as packets -
+         * which is where the 425 phantom packet3 opcodes (0xff, 0x8f,
+         * 0x03) and the "exceeded max iterations" bailouts came from.
+         * Those counts were identical across runs regardless of any
+         * indirect-buffer change, which is what showed they came from the
+         * ring rather than from indirect buffers.
+         */
+        s->cce.wptr = (data & 0x3fffff) % PM4_192PIO_RING_DWORDS;
         ati_cce_process(s);
         break;
     case PM4_VC_FORMAT:

@@ -66,7 +66,23 @@
  * actually observed with generous headroom, while still bounding the work
  * done for one submission.
  */
-#define CCE_MAX_INDIRECT_DWORDS 65536
+/*
+ * Sanity limit on one indirect buffer, in dwords.
+ *
+ * Neither r128_reg.h nor the Radeon header documents the width of the
+ * CP_IB_BUFSZ (0x073c) size field, so this is a plausibility bound rather
+ * than a decoded field mask. Measured from a Tux Racer capture: of 9895
+ * submissions, 9648 have nothing set above bit 13 and are almost all
+ * between 2 and 96 dwords; the rest carried a size-class flag in the top
+ * bit, which ati.c now strips before calling here.
+ *
+ * With that stripping in place the remaining large values - a band around
+ * 21000-22000 dwords - are genuine buffers, and a 16384 bound was
+ * discarding 1268 of them per run, which is real work the driver expects
+ * to have executed. This is now only a backstop against a wild value, not
+ * a plausibility filter.
+ */
+#define CCE_MAX_INDIRECT_DWORDS 262144
 
 /* Largest packet3 payload we'll buffer locally before dispatching. */
 #define CCE_MAX_PACKET3_PAYLOAD ATI_CCE_MAX_PKT3
@@ -116,6 +132,7 @@ static inline float ati_3d_f(uint32_t bits)
 /* Defined below, next to the indirect buffer fetch that also uses it. */
 static bool ati_gart_translate(ATIVGAState *s, uint32_t off, hwaddr *pa);
 static bool ati_tex_loc_lookup(ATIVGAState *s, uint32_t page, bool *in_gart);
+static bool ati_addr_in_display_buffer(ATIVGAState *s, uint32_t off);
 static void ati_tex_loc_record(ATIVGAState *s, uint32_t page, bool in_gart);
 
 /*
@@ -368,7 +385,15 @@ static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
             "linear\n", t->tile_mode);
     }
 
+    /*
+     * Clear geometry too, not just the valid flag: a caller that ignores
+     * ->valid, or any future path that reads these before checking it,
+     * must not see another texture's dimensions.
+     */
     t->valid = false;
+    t->w = t->h = t->pitch = 0;
+    t->base = NULL;
+    t->in_gart = false;
     if (!enabled) {
         return;
     }
@@ -412,32 +437,48 @@ static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
     /*
      * Decide where the texture lives.
      *
-     * First check whether a write to this exact page was recorded: that's
-     * ground truth, not a guess. Only when nothing has ever been written
-     * there - a texture the driver uploaded before this GART page table
-     * was in the state we can see, or one we haven't traced the upload
-     * for - fall back to trying GART translation and treating success as
-     * evidence, which is unreliable on its own: the page table covers the
-     * whole aperture, so almost any offset "translates" to some physical
-     * address whether or not that's where this texture's data actually is.
+     * Order matters, and the rule is: video memory whenever the texture
+     * can be there, GART only when it cannot.
+     *
+     *  1. A recorded upload is ground truth - some write actually landed
+     *     on this page, so use whichever memory it went to.
+     *  2. Otherwise prefer video memory, provided the texture fits and the
+     *     address is not inside a display surface. Most textures are
+     *     written by the guest CPU straight through the linear aperture,
+     *     which leaves no trace for the cache to record: gltest2 does
+     *     19038 correct 8x8 samples from 0x494000 in a run with zero host
+     *     data blits and no 2D blit writing that address.
+     *  3. Only fall through to the GART when video memory is impossible -
+     *     the texture would not fit, or the address belongs to a
+     *     framebuffer. Video memory is never swapped out from under us,
+     *     so a texture that fits there needs no GART lookup at all.
+     *
+     * The display-surface test is what keeps Quartz out of the scene. Those
+     * window backing stores sit at exactly the offsets textures use, and
+     * sampling one paints the desktop onto geometry.
      */
     {
         uint32_t page = off & ~0xfffU;
         bool known_in_gart;
+        bool fits_vram = off + (size_t)t->h * t->pitch <= s->vga.vram_size;
+        bool is_display = ati_addr_in_display_buffer(s, off);
 
         if (ati_tex_loc_lookup(s, page, &known_in_gart)) {
             t->in_gart = known_in_gart;
+        } else if (fits_vram && !is_display) {
+            t->in_gart = false;
         } else {
             hwaddr pa;
 
             t->in_gart = ati_gart_translate(s, page, &pa);
         }
-    }
-    if (!t->in_gart) {
-        if (off + (size_t)t->h * t->pitch > s->vga.vram_size) {
-            return;
+
+        if (!t->in_gart) {
+            if (!fits_vram || is_display) {
+                return;
+            }
+            t->base = s->vga.vram_ptr + off;
         }
-        t->base = s->vga.vram_ptr + off;
     }
     t->valid = true;
 }
@@ -473,17 +514,24 @@ static void ati_3d_texel(ATI3DTex *t, float fs, float ft,
         uint32_t c = ldl_be_p(p + x * 4);
 
         /*
-         * Texels really are A,R,G,B. A sampled run reads
-         *   ff57a7ef ff57a6ef ff54a5ef ...
-         * - a constant 0xff leading byte with the colour varying smoothly
-         * after it, i.e. opaque alpha and a light blue. Reading it as
-         * R,G,B,A turns that into a saturated pink, which is what tinted
-         * the whole scene red.
+         * Texels are R,G,B,A in memory.
+         *
+         * A controlled test settles this: gltest2 uploads a texture whose
+         * exact bytes are known. Red is FF,00,00,FF, which read big-endian
+         * is 0xFF0000FF - decoding that as A,R,G,B yields blue, and the
+         * blue row 00,00,FF,FF yields cyan with zero alpha. Both of those
+         * wrong colours are exactly what appeared on screen, and black
+         * (00,00,00,FF) came out fully transparent, which is why the
+         * checkerboard collapsed into flat bands instead of alternating.
+         *
+         * An earlier sample of Quake 3 data looked like opaque ARGB, but
+         * that was read from an address later shown to hold a Quartz window
+         * surface rather than texture data, so it proved nothing.
          */
-        *a = ((c >> 24) & 0xff) / 255.0f;
-        *r = ((c >> 16) & 0xff) / 255.0f;
-        *g = ((c >> 8) & 0xff) / 255.0f;
-        *b = (c & 0xff) / 255.0f;
+        *r = ((c >> 24) & 0xff) / 255.0f;
+        *g = ((c >> 16) & 0xff) / 255.0f;
+        *b = ((c >> 8) & 0xff) / 255.0f;
+        *a = (c & 0xff) / 255.0f;
         break;
     }
     case TEX_DATATYPE_RGB565: {
@@ -590,6 +638,148 @@ static void ati_3d_combine_sec(uint32_t combine_cntl,
     }
 }
 
+/*
+ * Depth buffer support.
+ *
+ * Z_OFFSET_C / Z_PITCH_C give the buffer, Z_STEN_CNTL_C the pixel width and
+ * compare function, and TEX_CNTL_C bits 0 and 1 enable testing and writing
+ * (all per r128_reg.h). Without this the rasterizer drew in submission
+ * order, so overlapping objects - glxgears' three gears, a level's far and
+ * near walls - resolved by whichever happened to be drawn last.
+ */
+typedef struct ATI3DZBuf {
+    bool test;              /* Z_ENABLE */
+    bool write;             /* Z_WRITE_ENABLE */
+    unsigned func;          /* Z_TEST_* compare, already shifted down */
+    unsigned bypp;          /* 2 for 16-bit, 4 for 24/32-bit */
+    uint8_t *base;
+    unsigned pitch;         /* bytes per row */
+    size_t limit;           /* bytes available from base to end of VRAM */
+} ATI3DZBuf;
+
+static void ati_3d_zbuf_setup(ATIVGAState *s, ATI3DZBuf *z)
+{
+    unsigned width_sel;
+
+    z->test = (s->regs.tex_cntl & TEX_CNTL_Z_ENABLE) != 0;
+    z->write = (s->regs.tex_cntl & TEX_CNTL_Z_WRITE_ENABLE) != 0;
+    if (!z->test && !z->write) {
+        return;
+    }
+
+    z->func = (s->regs.z_sten_cntl & Z_TEST_MASK) >> Z_TEST_SHIFT;
+    width_sel = (s->regs.z_sten_cntl & Z_PIX_WIDTH_MASK) >> Z_PIX_WIDTH_SHIFT;
+    z->bypp = (width_sel == 0) ? 2 : 4;
+    /*
+     * Z_PITCH_C counts 8-PIXEL units, so the byte stride depends on the
+     * depth format's own width - 8 * bypp, not a flat 32.
+     *
+     * Checked against two captures. A 32-bit depth run has Z_PITCH 0x26
+     * (38) with a 1216-byte colour pitch: 38 * 8 * 4 = 1216, and both
+     * buffers are 304 pixels wide. A 16-bit depth run has 0x64 (100) with
+     * a 3200-byte colour pitch: 100 * 8 * 2 = 1600 bytes, 800 pixels -
+     * matching the 800-pixel colour buffer, where a flat * 32 would have
+     * made the depth buffer 1600 pixels wide and desynchronised every row.
+     */
+    z->pitch = (s->regs.z_pitch & Z_PITCH_MASK) * 8 * z->bypp;
+
+    if (!z->pitch) {
+        z->test = z->write = false;
+        return;
+    }
+    if ((size_t)s->regs.z_offset + z->pitch > s->vga.vram_size) {
+        z->test = z->write = false;
+        return;
+    }
+    z->base = s->vga.vram_ptr + s->regs.z_offset;
+    z->limit = s->vga.vram_size - s->regs.z_offset;
+
+    {
+        static bool logged;
+
+        if (!logged) {
+            logged = true;
+            qemu_log("ati_3d: zbuffer test=%d write=%d func=%u bypp=%u "
+                     "off=0x%x pitch=%u\n",
+                     z->test, z->write, z->func, z->bypp,
+                     s->regs.z_offset, z->pitch);
+        }
+    }
+}
+
+/*
+ * Returns true if the fragment passes, and stores the new depth when the
+ * test passes and writing is enabled.
+ */
+static bool ati_3d_ztest(ATI3DZBuf *z, unsigned x, unsigned y, float zf)
+{
+    uint8_t *p;
+    uint32_t zmax, znew, zold;
+    bool pass;
+
+    if (!z->test && !z->write) {
+        return true;
+    }
+    /* Stay inside video memory; a bad offset must not fault the host. */
+    if ((size_t)y * z->pitch + (size_t)(x + 1) * z->bypp > z->limit) {
+        return true;
+    }
+    p = z->base + (size_t)y * z->pitch + (size_t)x * z->bypp;
+
+    zmax = (z->bypp == 2) ? 0xffff : 0x00ffffff;
+    zf = (zf < 0.0f) ? 0.0f : (zf > 1.0f ? 1.0f : zf);
+    znew = (uint32_t)(zf * (float)zmax);
+
+    zold = (z->bypp == 2) ? lduw_be_p(p) : (ldl_be_p(p) & 0x00ffffff);
+
+    /*
+     * An all-zero depth buffer means it has never been cleared as far as
+     * we can tell. The guest clears depth with CPU writes through the
+     * linear aperture, which leave no trace here, and if that clear does
+     * not reach the memory we read then every fragment fails a LESS test
+     * against zero and the whole scene goes black - measured: znew=43689
+     * against zold=0 for every pixel of gltest2.
+     *
+     * Treat a zero slot as "nothing has been drawn here yet" and let the
+     * fragment through, still writing its depth. Once real depths are in
+     * the buffer the comparison behaves normally, so objects still sort
+     * against each other; only the very first fragment at each pixel gets
+     * a free pass, which is exactly what a cleared buffer would give it.
+     */
+    if (zold == 0) {
+        if (z->write) {
+            if (z->bypp == 2) {
+                stw_be_p(p, znew);
+            } else {
+                stl_be_p(p, (ldl_be_p(p) & 0xff000000) | znew);
+            }
+        }
+        return true;
+    }
+
+    switch (z->func) {
+    case 0:  pass = false;                break;  /* NEVER */
+    case 1:  pass = znew <  zold;         break;  /* LESS */
+    case 2:  pass = znew <= zold;         break;  /* LESSEQUAL */
+    case 3:  pass = znew == zold;         break;  /* EQUAL */
+    case 4:  pass = znew >= zold;         break;  /* GREATEREQUAL */
+    case 5:  pass = znew >  zold;         break;  /* GREATER */
+    case 6:  pass = znew != zold;         break;  /* NEQUAL */
+    default: pass = true;                 break;  /* ALWAYS */
+    }
+    if (!z->test) {
+        pass = true;
+    }
+    if (pass && z->write) {
+        if (z->bypp == 2) {
+            stw_be_p(p, znew);
+        } else {
+            stl_be_p(p, (ldl_be_p(p) & 0xff000000) | znew);
+        }
+    }
+    return pass;
+}
+
 static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
                        const ATI3DVert *b, const ATI3DVert *c,
                        bool textured, bool has_s2t2)
@@ -600,13 +790,37 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
      * engine applies. Dividing by 8 as well squeezed every row into an
      * eighth of its width and piled the image into a band at the top.
      */
-    unsigned pitch = s->regs.dst_pitch * 32;
-    uint8_t *base = s->vga.vram_ptr + s->regs.dst_offset;
+    /*
+     * The CCE context's target (DST_PITCH_OFFSET_C), not whatever a plain
+     * MMIO DST_PITCH_OFFSET write last left behind - see ati_int.h. Fall
+     * back to the shared state if _C has never been programmed, so a guest
+     * that only uses the MMIO register still renders somewhere sane rather
+     * than at offset 0 with a zero pitch.
+     */
+    unsigned pitch = s->regs.dst_pitch_3d ?
+                     s->regs.dst_pitch_3d * 32 : s->regs.dst_pitch * 32;
+    uint8_t *base = s->vga.vram_ptr + (s->regs.dst_pitch_3d ?
+                     s->regs.dst_offset_3d : s->regs.dst_offset);
     int minx, maxx, miny, maxy, x, y;
     float area;
     /* Static: holds a 4 KiB page cache, too large for the stack and worth
      * keeping warm across the triangles of a single draw. */
-    static ATI3DTex tex, tex2;
+    /*
+     * Not static. These used to persist across calls, which meant any early
+     * return inside the setup path - texturing disabled, a zero dimension,
+     * an address that will not translate - left the PREVIOUS texture's
+     * width, height and pitch in place. The new texture's memory was then
+     * sampled with the old texture's stride, which is exactly the kind of
+     * mismatch that renders as horizontal banding across a surface.
+     *
+     * gltest2 never showed it because it binds a single texture for the
+     * whole run, so the stale geometry always happened to be correct.
+     * Quake 3 switches textures constantly - 197800 draws reported 512x512
+     * while the size register was being programmed with 8x8, 16x16, 32x32,
+     * 64x64, 128x128, 128x64 and 256x256 for those same draws.
+     */
+    ATI3DTex tex, tex2;
+    ATI3DZBuf zbuf = { 0 };
     bool blend, use_sec;
     unsigned src_fn, dst_fn;
 
@@ -663,6 +877,23 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
         if (cull) {
             culled++;
         }
+        /*
+         * Log the first few culling decisions with their winding, so an
+         * inverted sign is visible directly rather than inferred from a
+         * ratio. For a closed object both signs must appear; if every
+         * culled triangle shares one sign and every kept one the other,
+         * that is correct - if the kept set is the one facing away, the
+         * comparison below is backwards.
+         */
+        {
+            static unsigned n_dec;
+
+            if (n_dec < 12 && backface_mode == 0) {
+                n_dec++;
+                qemu_log("ati_3d: cull decision area=%+.1f front=%d "
+                         "cull=%d\n", area, is_front, cull);
+            }
+        }
         if ((submitted % 20000) == 0) {
             qemu_log("ati_3d: culling: %lu submitted, %lu culled (%lu%%) "
                      "front_ccw=%d mode=%u\n",
@@ -707,6 +938,8 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
     }
     use_sec = tex2.valid;
 
+    ati_3d_zbuf_setup(s, &zbuf);
+
     /*
      * One-shot log of the setup-engine registers. SETUP_CNTL and
      * PM4_VC_FPU_SETUP are decoded values, not raw bytes to interpret -
@@ -720,6 +953,26 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
     {
         static bool logged_setup;
 
+        /*
+         * SETUP_CNTL bit 19 selects subpixel precision: SUB_PIX_2BITS (0)
+         * or SUB_PIX_4BITS (1), per r128_reg.h. This has never been read,
+         * and Tux Racer sets it (SETUP_CNTL=0x80220) while Quake 3 and
+         * gltest2 do not - which lines up with Tux Racer being the one
+         * app whose vertices arrive as ~0.016 instead of screen pixels.
+         * Log what each candidate scaling would produce for a real vertex
+         * so the right transform can be read off rather than guessed.
+         */
+        if (!logged_setup) {
+            unsigned subpix = (s->regs.setup_cntl >> 19) & 1;
+
+            qemu_log("ati_3d: SUB_PIX_%uBITS  raw v0=(%.6f,%.6f)  "
+                     "x16=(%.3f,%.3f)  x256=(%.3f,%.3f)  "
+                     "x4096=(%.3f,%.3f)\n",
+                     subpix ? 4 : 2, a->x, a->y,
+                     a->x * 16.0f, a->y * 16.0f,
+                     a->x * 256.0f, a->y * 256.0f,
+                     a->x * 4096.0f, a->y * 4096.0f);
+        }
         if (!logged_setup) {
             uint32_t sc = s->regs.setup_cntl;
             uint32_t fpu = s->regs.vc_fpu_setup;
@@ -817,6 +1070,20 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
             if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
                 continue;
             }
+
+            /*
+             * Depth test before shading: a fragment that loses here costs
+             * nothing further, and texture sampling is the expensive part.
+             * Interpolated with the same barycentrics as everything else.
+             */
+            if (zbuf.test || zbuf.write) {
+                float pz = w1 * a->z + w2 * b->z + w0 * c->z;
+
+                if (!ati_3d_ztest(&zbuf, x, y, pz)) {
+                    continue;
+                }
+            }
+
             /* w1 weights a, w2 weights b, w0 weights c */
             sr = w1 * a->r + w2 * b->r + w0 * c->r;
             sg = w1 * a->g + w2 * b->g + w0 * c->g;
@@ -916,7 +1183,8 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
     }
 
     if (maxy >= miny) {
-        ram_addr_t off = (s->regs.dst_offset + (size_t)miny * pitch);
+        ram_addr_t off = ((s->regs.dst_pitch_3d ? s->regs.dst_offset_3d :
+                           s->regs.dst_offset) + (size_t)miny * pitch);
         ram_addr_t len = (size_t)(maxy - miny + 1) * pitch;
 
         if (off < s->vga.vram_size) {
@@ -1064,7 +1332,21 @@ static void ati_3d_draw(ATIVGAState *s, unsigned opcode,
     nvtx = vc_cntl >> CCE_VC_CNTL_NUM_SHIFT;
 
     ati_3d_layout(format, &l);
-    l.st_direct = (s->regs.setup_cntl & (1 << 9)) != 0;
+    /*
+     * Do the perspective divide on S,T.
+     *
+     * This was gated on SETUP_CNTL bit 9, read as "coordinates are already
+     * final" - a bit position I assumed rather than verified, and it was
+     * backwards. Measured: gltest2 emits texcoords of exactly 1.0, and what
+     * arrives is 0.2000 while RHW is 0.2000. Across frames the pair tracks
+     * (0.1986/0.2004, 0.1972/0.2008, 0.1958/0.2011) with the product
+     * holding at 1.0, so the driver is sending S*W and T*W and the divide
+     * is always required. Skipping it shrank every texture coordinate by a
+     * factor of W, so only the top-left corner of a texture was ever
+     * sampled - which is why an 8x8 checkerboard rendered as two or three
+     * flat blocks.
+     */
+    l.st_direct = false;
     if (!l.stride || nvtx < 3) {
         return;
     }
@@ -1133,13 +1415,20 @@ static void ati_3d_draw(ATIVGAState *s, unsigned opcode,
         if (n_log < 4000) {
             n_log++;
             qemu_log("ati_3d: %s prim=%u walk=0x%x nvtx=%u stride=%u "
-                     "fmt=0x%x gart=0x%x dst=0x%x pitch=%u "
-                     "v0=(%f,%f,%f) rgba=(%.2f,%.2f,%.2f,%.2f)\n",
+                     "fmt=0x%x off_st=%d st_direct=%d gart=0x%x dst=0x%x "
+                     "pitch=%u v0=(%f,%f,%f) rgba=(%.2f,%.2f,%.2f,%.2f) "
+                     "st0=(%.4f,%.4f) st1=(%.4f,%.4f) st2=(%.4f,%.4f) "
+                     "rhw0=%.4f\n",
                      indexed ? "indx" : "inline", prim, walk, nvtx,
-                     l.stride, format, gart_off, s->regs.dst_offset,
-                     s->regs.dst_pitch * 32,
+                     l.stride, format, l.off_st, l.st_direct,
+                     gart_off, s->regs.dst_offset_3d,
+                     s->regs.dst_pitch_3d * 32,
                      v[0].x, v[0].y, v[0].z,
-                     v[0].r, v[0].g, v[0].b, v[0].a);
+                     v[0].r, v[0].g, v[0].b, v[0].a,
+                     v[0].s, v[0].t,
+                     nvtx > 1 ? v[1].s : 0.0f, nvtx > 1 ? v[1].t : 0.0f,
+                     nvtx > 2 ? v[2].s : 0.0f, nvtx > 2 ? v[2].t : 0.0f,
+                     v[0].rhw);
         }
     }
 }
@@ -1273,34 +1562,49 @@ static void ati_cce_dispatch_packet3(ATIVGAState *s, uint32_t header,
                     uint32_t a = dst + (uint32_t)col * bypp;
                     uint32_t page = a & ~0xfffU;
 
-                    hwaddr pa;
-
                     /*
-                     * Write where the texture is actually read from. The
-                     * upload used to go to video memory while the sampler
-                     * read AGP, so the two never met - and worse, it wrote
-                     * over whatever Quartz had at that address.
+                     * Host data blits write to VIDEO MEMORY, never through
+                     * the GART.
                      *
-                     * Record which memory this page actually went to, so
-                     * the sampler can use the same one instead of guessing.
-                     * A GART translation succeeding is not proof the
-                     * texture belongs there - the page table covers the
-                     * whole aperture, so almost any offset "translates" to
-                     * some physical address whether or not that's where
-                     * this texture's data is. Tying the read to the write
-                     * removes that ambiguity.
+                     * This used to translate the destination offset and,
+                     * when it resolved, pci_dma_write the pixels into
+                     * system RAM. But the GART maps the driver's command
+                     * buffers, and in a Tux Racer capture those occupy
+                     * 0x20..0xf9f840 while texture destinations run
+                     * 0x6d0f80..0xffa720 - a large overlap. Every upload
+                     * landing in that window DMA'd kilobytes of texel data
+                     * straight over the driver's own command memory, which
+                     * it later read back as pointers: a fixed faulting PC
+                     * inside ATIRage128 with a different garbage address
+                     * every run.
+                     *
+                     * The sampler reading textures through the GART is a
+                     * separate matter and stays as it is; that the read
+                     * path resolves there was never a reason for the write
+                     * path to do the same.
                      */
-                    if (ati_gart_translate(s, page, &pa)) {
-                        uint32_t be = cpu_to_be32(data[i + dw]);
-
-                        pci_dma_write(&s->dev, pa + (a & 0xfff), &be, 4);
-                        if (page != last_page) {
-                            ati_tex_loc_record(s, page, true);
-                            last_page = page;
-                        }
-                    } else if (a + 4 <= s->vga.vram_size) {
+                    if (a + 4 <= s->vga.vram_size) {
                         stl_be_p(s->vga.vram_ptr + a, data[i + dw]);
-                        if (page != last_page) {
+                        /*
+                         * Only record this page as a texture location if
+                         * it is not inside a display buffer.
+                         *
+                         * Some upload destinations land inside the front
+                         * buffer - measured: 0x6b6480, 0x6bcf00, 0x6c79e0,
+                         * 0x6d0f80 and 0x6d1f80 all sit within the
+                         * 0x614d00..0x78bd00 front buffer. Recording those
+                         * told the sampler "a texture lives here", so it
+                         * read the page back and got whatever frame had
+                         * most recently been presented - the desktop, the
+                         * Activity Monitor's bar graphs - and painted it
+                         * onto geometry.
+                         *
+                         * Leaving such a page unrecorded sends the sampler
+                         * to the GART instead, which is where textures
+                         * actually come from.
+                         */
+                        if (page != last_page &&
+                            !ati_addr_in_display_buffer(s, a)) {
                             ati_tex_loc_record(s, page, false);
                             last_page = page;
                         }
@@ -1686,6 +1990,79 @@ static bool ati_gart_translate(ATIVGAState *s, uint32_t off, hwaddr *pa)
     return true;
 }
 
+/*
+ * Is this video-memory offset inside a buffer the display pipeline owns?
+ *
+ * Covers the scanned-out surface (CRTC_OFFSET with the CRTC pitch) and the
+ * 3D render target (DST_PITCH_OFFSET_C). A texture upload whose destination
+ * falls in either is not really establishing a texture there - the address
+ * is shared with a display buffer, and reading it back yields frame content
+ * rather than texels.
+ *
+ * Height is not known from the registers alone, so this uses the largest
+ * plausible display height. Over-estimating only means a page is left
+ * unrecorded and the sampler consults the GART, which is the safe direction;
+ * under-estimating would let frame content be sampled as a texture.
+ */
+static bool ati_addr_in_display_buffer(ATIVGAState *s, uint32_t off)
+{
+    unsigned i;
+
+    /*
+     * The CRTC and 3D-target registers do not describe every display
+     * surface: an app can keep its own back/front pair. In one capture the
+     * scanout was 0x8000 and the 3D target 0x312000, while Quake 3's front
+     * buffer sat at 0x614d00 - named in neither register, yet five texture
+     * uploads landed inside it.
+     *
+     * So the set is learned from traffic instead: ati_2d_note_surface()
+     * records any destination the 2D engine blits a full-width span to,
+     * which is what presenting a frame looks like. A texture upload into
+     * one of those is not establishing a texture.
+     */
+    for (i = 0; i < ARRAY_SIZE(s->display_surf); i++) {
+        uint32_t base = s->display_surf[i].base;
+        uint32_t span = s->display_surf[i].span;
+
+        if (span && off >= base && off < base + span) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Remember a blit destination that looks like a display surface: at least
+ * 256 pixels wide and covering many lines. Kept in a tiny ring - there are
+ * only ever a handful of such buffers.
+ */
+void ati_2d_note_surface(ATIVGAState *s, uint32_t off, unsigned pitch,
+                         unsigned w, unsigned h)
+{
+    unsigned i;
+
+    if (w < 256 || h < 64 || !pitch) {
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(s->display_surf); i++) {
+        if (s->display_surf[i].base == off) {
+            return;                 /* already known */
+        }
+    }
+    i = s->display_surf_next % ARRAY_SIZE(s->display_surf);
+    s->display_surf[i].base = off;
+    /*
+     * Span the region this blit actually covered, not a worst-case
+     * display height. Using pitch * ATI_MAX_DISPLAY_LINES claimed ~3 MiB
+     * for a 2560-byte pitch, which swallowed legitimate textures that
+     * happen to sit near a framebuffer - gltest2's 8x8 texture among them,
+     * leaving it unrecorded so the sampler looked in the GART and found
+     * nothing.
+     */
+    s->display_surf[i].span = pitch * h;
+    s->display_surf_next++;
+}
+
 static inline unsigned ati_tex_loc_hash(uint32_t page)
 {
     return (page >> 12) & (ATI_TEX_LOC_CACHE_SIZE - 1);
@@ -1750,10 +2127,27 @@ void ati_cce_exec_indirect(ATIVGAState *s, uint32_t dwords)
         return;
     }
     if (dwords > CCE_MAX_INDIRECT_DWORDS) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-            "ati_cce: indirect buffer of %u dwords looks wrong, truncating "
-            "to %u\n", dwords, (unsigned)CCE_MAX_INDIRECT_DWORDS);
-        dwords = CCE_MAX_INDIRECT_DWORDS;
+        /*
+         * Skip, don't truncate. A capture showed submissions of 67600 and
+         * 262538 dwords - over a megabyte - among 2959 that exceeded 1000,
+         * while genuine buffers are almost all 2 to 96 dwords. Truncating
+         * such a value meant walking 64K dwords of unrelated GART memory
+         * and dispatching it as commands, which is where the phantom
+         * packet3 opcodes (0xff, 0x8f, 0x03) came from and a plausible
+         * route to the corrupted driver state behind the ATIRage128
+         * kernel panic. An implausible size means the submission itself
+         * is not trustworthy, so execute none of it.
+         */
+        /*
+         * Plain qemu_log, not LOG_GUEST_ERROR: that mask only prints with
+         * -d guest_errors, so this diagnostic was being discarded on a
+         * command line carrying only -d unimp, making it look like the
+         * check never fired.
+         */
+        qemu_log("ati_cce: indirect buffer of %u dwords exceeds %u, "
+                 "skipping the submission rather than executing garbage\n",
+                 dwords, (unsigned)CCE_MAX_INDIRECT_DWORDS);
+        return;
     }
 
     st = g_new0(ATICCEStream, 1);

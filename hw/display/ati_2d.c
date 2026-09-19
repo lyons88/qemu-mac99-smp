@@ -86,7 +86,8 @@ static int ati_bpp_from_datatype(ATIVGAState *s)
  * bottom to top to avoid clobbering unread source data, and "path" which
  * implementation ran.
  */
-static void ati_2d_log_blt(unsigned src_x, unsigned src_y,
+static void ati_2d_log_blt(ATIVGAState *s,
+                           unsigned src_x, unsigned src_y,
                            unsigned dst_x, unsigned dst_y,
                            unsigned w, unsigned h,
                            unsigned src_pitch, unsigned dst_pitch,
@@ -116,6 +117,22 @@ static void ati_2d_log_blt(unsigned src_x, unsigned src_y,
         qemu_log("ati_2d: %lu blits, %lu overlapping, %lu reversed\n",
                  total, n_overlap, n_backwards);
     }
+
+    /*
+     * Both endpoints of a large blit are candidate display surfaces: a
+     * frame present reads one and writes the other. Recording them lets
+     * the texture-upload path recognise an address that belongs to a
+     * framebuffer rather than to a texture.
+     */
+    /*
+     * Only the DESTINATION indicates a display surface. Recording sources
+     * too was wrong: an app blits its rendered frame OUT of a buffer, and
+     * textures get read the same way - 82 blits in one capture read from
+     * 0x494100, which made the texture at 0x494000 look like framebuffer
+     * memory. Every texture was then pushed to the GART, where nothing had
+     * written it, and gltest2 and glxgears both lost their textures.
+     */
+    ati_2d_note_surface(s, dst_off, dst_pitch, w, h);
 }
 
 static void ati_2d_mark_dirty(ATIVGAState *s, uint8_t *dst_bits,
@@ -321,7 +338,7 @@ void ati_2d_blt(ATIVGAState *s)
                 memmove(&dst_bits[i], &src_bits[j], s->regs.dst_width * bypp);
             }
         }
-        ati_2d_log_blt(src_x, src_y, dst_x, dst_y,
+        ati_2d_log_blt(s, src_x, src_y, dst_x, dst_y,
                        s->regs.dst_width, s->regs.dst_height,
                        src_stride * (unsigned)sizeof(uint32_t),
                        dst_pitch_bytes,
