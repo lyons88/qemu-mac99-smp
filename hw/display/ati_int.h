@@ -56,7 +56,7 @@ typedef struct ATIVGARegs {
     uint32_t prim_tex_cntl;     /* 0x1cb0 PRIM_TEX_CNTL_C */
     uint32_t prim_tex_combine;  /* 0x1cb4 PRIM_TEXTURE_COMBINE_CNTL_C */
     uint32_t tex_size_pitch;    /* 0x1cb8 TEX_SIZE_PITCH_C */
-    uint32_t prim_tex_offset;   /* 0x1cbc PRIM_TEX_0_OFFSET_C */
+    uint32_t prim_tex_offset[11];  /* 0x1cbc PRIM_TEX_0..10_OFFSET_C */
     uint32_t misc_3d_state;     /* 0x1ca0 MISC_3D_STATE_CNTL_REG */
     uint32_t setup_cntl;        /* 0x1bc4 SETUP_CNTL - winding/ST-mode/etc */
     uint32_t vc_fpu_setup;      /* 0x071c PM4_VC_FPU_SETUP - front dir, cull */
@@ -75,13 +75,21 @@ typedef struct ATIVGARegs {
     uint32_t dst_pitch_3d;
     uint32_t dst_tile_3d;
 
+    uint32_t amcgpio_mask_mir;   /* 0x009c AMCGPIO_MASK_MIR */
+    uint32_t amcgpio_a_mir;      /* 0x00a0 AMCGPIO_A_MIR */
+    uint32_t amcgpio_en_mir;     /* 0x00a8 AMCGPIO_EN_MIR */
+    uint32_t i2c_cntl_1;         /* 0x0094 I2C_CNTL_1 */
+    uint32_t fp_gen_cntl;        /* 0x0284 FP_GEN_CNTL */
+    uint32_t clock_cntl_index;   /* 0x0008 CLOCK_CNTL_INDEX */
+    uint32_t pll[64];            /* PLL regs behind CLOCK_CNTL_DATA */
+    uint32_t pc_gui_ctlstat;     /* 0x1748 / 0x0184 pixel cache ctl/stat */
     uint32_t z_offset;           /* 0x1c90 Z_OFFSET_C */
     uint32_t z_pitch;            /* 0x1c94 Z_PITCH_C */
     uint32_t z_sten_cntl;        /* 0x1c98 Z_STEN_CNTL_C */
 
     uint32_t sec_tex_cntl;       /* 0x1d00 SEC_TEX_CNTL_C */
     uint32_t sec_tex_combine;    /* 0x1d04 SEC_TEX_COMBINE_CNTL_C */
-    uint32_t sec_tex_offset;     /* 0x1d08 SEC_TEX_0_OFFSET_C */
+    uint32_t sec_tex_offset[11];  /* 0x1d08 SEC_TEX_0..10_OFFSET_C */
     uint32_t palette[256];
     uint32_t crtc_h_total_disp;
     uint32_t crtc_h_sync_strt_wid;

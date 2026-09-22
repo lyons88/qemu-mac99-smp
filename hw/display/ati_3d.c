@@ -82,7 +82,14 @@
  * to have executed. This is now only a backstop against a wild value, not
  * a plausibility filter.
  */
-#define CCE_MAX_INDIRECT_DWORDS 262144
+/*
+ * Backstop only. Measured: Quake 3's intro movie uploads each frame as a
+ * 512x512 32-bit texture in one indirect buffer - 262144 dwords of pixels
+ * plus a 384-394 dword header (0x40180, 0x4018a). A limit of exactly
+ * 262144 threw every frame away, so the cinematic never updated. This
+ * allows 16 MiB of commands, which no legitimate single buffer exceeds.
+ */
+#define CCE_MAX_INDIRECT_DWORDS (4u * 1024 * 1024)
 
 /* Largest packet3 payload we'll buffer locally before dispatching. */
 #define CCE_MAX_PACKET3_PAYLOAD ATI_CCE_MAX_PKT3
@@ -131,9 +138,10 @@ static inline float ati_3d_f(uint32_t bits)
 
 /* Defined below, next to the indirect buffer fetch that also uses it. */
 static bool ati_gart_translate(ATIVGAState *s, uint32_t off, hwaddr *pa);
-static bool ati_tex_loc_lookup(ATIVGAState *s, uint32_t page, bool *in_gart);
 static bool ati_addr_in_display_buffer(ATIVGAState *s, uint32_t off);
 static void ati_tex_loc_record(ATIVGAState *s, uint32_t page, bool in_gart);
+static inline unsigned ati_tex_loc_hash(uint32_t page);
+static bool ati_tex_uploaded_here(ATIVGAState *s, uint32_t page);
 
 /*
  * Vertex format bits (r128_reg.h, R128_CCE_VC_FRMT_*). The position x, y, z
@@ -310,6 +318,8 @@ typedef struct ATI3DTex {
     unsigned w, h, pitch;   /* pixels, pixels, bytes */
     unsigned bypp;          /* bytes per texel */
     unsigned datatype;
+    unsigned clamp_s;       /* TEX_CLAMP_S: 0 wrap 1 mirror 2 clamp 3 border */
+    unsigned clamp_t;       /* TEX_CLAMP_T, same encoding */
     /* One-page cache for the GART case - texel access is very coherent. */
     uint32_t cached_page;
     bool cache_valid;
@@ -362,12 +372,41 @@ static const uint8_t *ati_3d_texel_ptr(ATI3DTex *t, uint32_t off, unsigned n)
  * field (in PRIM_TEX_CNTL_C); the secondary unit is assumed to share the
  * primary's format, which is what every draw observed so far does.
  */
+/*
+ * Set up one texture unit.
+ *
+ * `half` is this unit's 16 bits of TEX_SIZE_PITCH_C (primary: low half,
+ * secondary: high half), each nibble a log2:
+ *   [3:0] pitch = width   [7:4] size = max(width, height)
+ *   [11:8] height         [15:12] min size = smallest mip level
+ *
+ * Mip levels are stored smallest-first: PRIM_TEX_0_OFFSET_C is the
+ * smallest level and the full-size image sits at slot (size - min_size).
+ * Always sampling slot 0 read the 1x1 mip of a mipmapped texture as if it
+ * were full size - running past it into whatever memory followed. That is
+ * what the very first trace of this project showed (PRIM_TEX_0_OFFSET_C
+ * pointing at the smallest uploaded mip). Non-mipmapped textures have
+ * min_size == size, so slot 0 was correct for them, which is why simple
+ * test programs rendered fine while Quake 3 did not.
+ *
+ * Width comes from the PITCH nibble, not SIZE: SIZE is the larger of the
+ * two dimensions (the mip count), so for a tall texture it overstated the
+ * width. Both points follow Bochs's Rage 128 model and Mesa's r128 driver.
+ */
 static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
-                                 uint32_t raw_offset, bool enabled,
-                                 unsigned size_shift, unsigned height_shift,
-                                 unsigned pitch_shift)
+                                 const uint32_t *offsets, uint32_t cntl,
+                                 bool enabled, uint32_t half)
 {
-    uint32_t sp = s->regs.tex_size_pitch;
+    int top = (int)((half >> 4) & 0xf) - (int)((half >> 12) & 0xf);
+    uint32_t raw_offset;
+
+    if (top < 0) {
+        top = 0;
+    }
+    if (top > 10) {
+        top = 10;
+    }
+    raw_offset = offsets[top];
     /*
      * Bits 31:30 are the tiling mode (R128_TEX_NO_TILE / TILED_BY_HOST /
      * TILED_BY_STORAGE / TILED_BY_STORAGE2), not part of the address - only
@@ -397,10 +436,12 @@ static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
     if (!enabled) {
         return;
     }
-    t->w     = 1u << ((sp >> size_shift) & 0xf);
-    t->h     = 1u << ((sp >> height_shift) & 0xf);
-    t->datatype = (s->regs.prim_tex_cntl & TEX_DATATYPE_MASK)
-                  >> TEX_DATATYPE_SHIFT;
+    t->w     = 1u << (half & 0xf);
+    t->h     = 1u << ((half >> 8) & 0xf);
+    /* This unit's own control word - the secondary used the primary's. */
+    t->datatype = (cntl & TEX_DATATYPE_MASK) >> TEX_DATATYPE_SHIFT;
+    t->clamp_s = (cntl >> 8) & 3;
+    t->clamp_t = (cntl >> 11) & 3;
 
     switch (t->datatype) {
     case TEX_DATATYPE_ARGB8888:
@@ -425,7 +466,7 @@ static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
      * quarter of the way along for 32bpp textures, which both striped the
      * image and walked off into whatever else was in video memory.
      */
-    t->pitch = (1u << ((sp >> pitch_shift) & 0xf)) * t->bypp;
+    t->pitch = t->w * t->bypp;
 
     if (!t->w || !t->h || !t->pitch) {
         return;
@@ -459,18 +500,68 @@ static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
      */
     {
         uint32_t page = off & ~0xfffU;
-        bool known_in_gart;
         bool fits_vram = off + (size_t)t->h * t->pitch <= s->vga.vram_size;
-        bool is_display = ati_addr_in_display_buffer(s, off);
+        bool is_display = ati_addr_in_display_buffer(s, off) &&
+                          !ati_tex_uploaded_here(s, off & ~0xfffU);
 
-        if (ati_tex_loc_lookup(s, page, &known_in_gart)) {
-            t->in_gart = known_in_gart;
-        } else if (fits_vram && !is_display) {
+        /*
+         * The upload-location cache is deliberately not consulted here any
+         * more. It is keyed only by page offset and is never invalidated,
+         * and every entry now says "VRAM" because host-data blits only
+         * write VRAM - so it could never add information the rule below
+         * lacks, only force a stale answer. Across an application relaunch
+         * the same offsets are reused for different data (a CPU-written or
+         * AGP texture this time), and the cache kept pointing the sampler
+         * at the previous run's pixels.
+         */
+        if (fits_vram && !is_display) {
             t->in_gart = false;
         } else {
             hwaddr pa;
 
             t->in_gart = ati_gart_translate(s, page, &pa);
+        }
+
+        {
+            /*
+             * One line per distinct texture base, so every run of an app
+             * shows up in the log - the older per-draw traces use lifetime
+             * counters and fall silent after the first launch.
+             */
+            static uint32_t seen[512];
+            static unsigned nseen;
+            unsigned k;
+            bool dup = false;
+
+            for (k = 0; k < nseen && k < ARRAY_SIZE(seen); k++) {
+                if (seen[k] == off) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                seen[nseen % ARRAY_SIZE(seen)] = off;
+                nseen++;
+                /*
+                 * How the texels got here, and the first one raw. Textures
+                 * written by our host-data upload and ones the guest wrote
+                 * through the aperture may sit in VRAM in different byte
+                 * orders; a red/blue swap on some textures only would show
+                 * up as the two groups disagreeing.
+                 */
+                uint32_t t0 = (off + 4 <= s->vga.vram_size) ?
+                              ldl_be_p(s->vga.vram_ptr + off) : 0;
+
+                qemu_log("ati_tex: base=0x%x %ux%u dt=%u %s%s clamp=%u/%u "
+                         "written=%s texel0=%08x\n",
+                         off, t->w, t->h, t->datatype,
+                         t->in_gart ? "gart" : "vram",
+                         is_display ? " IN-DISPLAY-SURFACE" : "",
+                         t->clamp_s, t->clamp_t,
+                         ati_tex_uploaded_here(s, off & ~0xfffU) ?
+                             "hostdata" : "cpu-aperture",
+                         t0);
+            }
         }
 
         if (!t->in_gart) {
@@ -483,7 +574,44 @@ static void ati_3d_tex_setup_raw(ATIVGAState *s, ATI3DTex *t,
     t->valid = true;
 }
 
-static void ati_3d_texel(ATI3DTex *t, float fs, float ft,
+/*
+ * Texture coordinate addressing, per TEX_CLAMP_S/T (r128_reg.h bits 8-9
+ * and 11-12): 0 wrap, 1 mirror, 2 clamp to edge, 3 border colour.
+ * Returns -1 for a border-colour lookup. `n` is a power of two.
+ * Only ever wrapping meant clamped surfaces - skies, menu art, anything
+ * drawn edge to edge - bled the opposite edge of the texture into theirs.
+ */
+static inline int ati_3d_tex_wrap(int c, unsigned n, unsigned mode)
+{
+    int m;
+
+    switch (mode & 3) {
+    case 0:
+        return c & (int)(n - 1);
+    case 1:
+        m = c & (int)(2 * n - 1);
+        return (m < (int)n) ? m : (int)(2 * n - 1) - m;
+    case 2:
+        return (c < 0) ? 0 : (c >= (int)n) ? (int)n - 1 : c;
+    default:
+        /*
+         * Border colour. We sample nearest-only and do not model the
+         * border colour register, so treat it as clamp-to-edge - which is
+         * also what GL_CLAMP produces with nearest filtering. Returning
+         * "outside" here turned every edge sample of 77 Quake 3 textures
+         * transparent black.
+         */
+        return (c < 0) ? 0 : (c >= (int)n) ? (int)n - 1 : c;
+    }
+}
+
+/*
+ * Inlined: this is called once per textured pixel and was 19% of all time
+ * inside QEMU during a timedemo. Inlining lets the compiler keep the
+ * texture's dimensions and base pointer in registers across the span
+ * instead of reloading them, and drops the call overhead per pixel.
+ */
+static inline void ati_3d_texel(ATI3DTex *t, float fs, float ft,
                          float *r, float *g, float *b, float *a)
 {
     /*
@@ -494,14 +622,21 @@ static void ati_3d_texel(ATI3DTex *t, float fs, float ft,
      * meant sampling whichever one happened to sit next door, so artwork
      * from one surface bled into another.
      */
-    int ix = (int)floorf(fs * (float)t->w);
-    int iy = (int)floorf(ft * (float)t->h);
-    unsigned x = (unsigned)(ix & (int)(t->w - 1));
-    unsigned y = (unsigned)(iy & (int)(t->h - 1));
+    int ix = ati_3d_tex_wrap((int)floorf(fs * (float)t->w), t->w, t->clamp_s);
+    int iy = ati_3d_tex_wrap((int)floorf(ft * (float)t->h), t->h, t->clamp_t);
+    unsigned x, y;
     const uint8_t *p;
 
     *a = 1.0f;
     *r = *g = *b = 1.0f;
+
+    /* Border mode outside the texture: transparent black border colour. */
+    if (ix < 0 || iy < 0) {
+        *r = *g = *b = *a = 0.0f;
+        return;
+    }
+    x = (unsigned)ix;
+    y = (unsigned)iy;
 
     p = ati_3d_texel_ptr(t, t->off + (uint32_t)y * t->pitch + x * t->bypp,
                          t->bypp);
@@ -511,27 +646,29 @@ static void ati_3d_texel(ATI3DTex *t, float fs, float ft,
     p -= (size_t)x * t->bypp;      /* the cases below index by x */
     switch (t->datatype) {
     case TEX_DATATYPE_ARGB8888: {
-        uint32_t c = ldl_be_p(p + x * 4);
-
         /*
-         * Texels are R,G,B,A in memory.
+         * Native Rage 128 ARGB8888: the dword 0xAARRGGBB stored little-
+         * endian, i.e. bytes B,G,R,A in video memory - as Bochs decodes it.
          *
-         * A controlled test settles this: gltest2 uploads a texture whose
-         * exact bytes are known. Red is FF,00,00,FF, which read big-endian
-         * is 0xFF0000FF - decoding that as A,R,G,B yields blue, and the
-         * blue row 00,00,FF,FF yields cyan with zero alpha. Both of those
-         * wrong colours are exactly what appeared on screen, and black
-         * (00,00,00,FF) came out fully transparent, which is why the
-         * checkerboard collapsed into flat bands instead of alternating.
+         * Measured across 299 coloured Quake 3 textures (first texel of
+         * each, transparent and grey ones excluded): read as R,G,B,A only
+         * 40 came out warm-toned; read as B,G,R,A, 231 did - and Quake 3's
+         * art is overwhelmingly brown, rust and orange. Textures the guest
+         * wrote itself agreed (4 to 0). Decoding R,G,B,A swapped red and
+         * blue on every texture: the flaming logo, CD KEY lettering, ACCEPT
+         * button and crosshair all came out blue, while vertex-tinted text
+         * looked right only because its texture is white.
          *
-         * An earlier sample of Quake 3 data looked like opaque ARGB, but
-         * that was read from an address later shown to hold a Quartz window
-         * surface rather than texture data, so it proved nothing.
+         * This reverses an earlier conclusion drawn from gltest2, which was
+         * reached before the mip-slot, texture-width and index-order fixes,
+         * while other faults could also have been altering colour.
          */
-        *r = ((c >> 24) & 0xff) / 255.0f;
-        *g = ((c >> 16) & 0xff) / 255.0f;
-        *b = ((c >> 8) & 0xff) / 255.0f;
-        *a = (c & 0xff) / 255.0f;
+        uint32_t c = ldl_le_p(p + x * 4);
+
+        *a = ((c >> 24) & 0xff) / 255.0f;
+        *r = ((c >> 16) & 0xff) / 255.0f;
+        *g = ((c >> 8) & 0xff) / 255.0f;
+        *b = (c & 0xff) / 255.0f;
         break;
     }
     case TEX_DATATYPE_RGB565: {
@@ -604,16 +741,15 @@ static void ati_3d_blend_factor(unsigned fn,
 static void ati_3d_tex0_setup(ATIVGAState *s, ATI3DTex *t)
 {
     ati_3d_tex_setup_raw(s, t, s->regs.prim_tex_offset,
-                         s->regs.tex_cntl != 0,
-                         TEX_SIZE_SHIFT, TEX_HEIGHT_SHIFT, TEX_PITCH_SHIFT);
+                         s->regs.prim_tex_cntl, s->regs.tex_cntl != 0,
+                         s->regs.tex_size_pitch & 0xffff);
 }
 
 static void ati_3d_tex1_setup(ATIVGAState *s, ATI3DTex *t)
 {
     ati_3d_tex_setup_raw(s, t, s->regs.sec_tex_offset,
-                         s->regs.sec_tex_cntl != 0,
-                         SEC_TEX_SIZE_SHIFT, SEC_TEX_HEIGHT_SHIFT,
-                         SEC_TEX_PITCH_SHIFT);
+                         s->regs.sec_tex_cntl, s->regs.sec_tex_cntl != 0,
+                         s->regs.tex_size_pitch >> 16);
 }
 
 /*
@@ -1018,7 +1154,7 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
             }
             qemu_log("ati_3d: #%u raw_off=0x%x masked_off=0x%x tile=%u "
                      "%s pa=0x%llx resolved=%d w=%u h=%u\n",
-                     seq, s->regs.prim_tex_offset, tex.off, tex.tile_mode,
+                     seq, s->regs.prim_tex_offset[0], tex.off, tex.tile_mode,
                      tex.in_gart ? "gart" : "vram",
                      (unsigned long long)pa, resolved, tex.w, tex.h);
         }
@@ -1047,27 +1183,61 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
         miny = 0;
     }
 
+    /*
+     * Barycentrics by incremental stepping.
+     *
+     * Both edge functions are linear in x and y, so their value at the next
+     * pixel differs by a constant. The loop used to evaluate each one from
+     * the three vertices at every pixel - including a division by the
+     * triangle area, twice per pixel. Division is the slowest arithmetic a
+     * core does, and this is the innermost loop of the whole rasteriser: at
+     * 1024x768 it runs tens of millions of times a second.
+     *
+     * Reciprocal once per triangle, constant steps per pixel and per row.
+     * Same values, same order of operations within a row, no divides.
+     */
+    const float inv_area = 1.0f / area;
+    const float w0_dx = -(b->y - a->y) * inv_area;
+    const float w1_dx = -(c->y - b->y) * inv_area;
+    const float x0 = minx + 0.5f;
+
+    /*
+     * Every interpolated value is w1*a + w2*b + w0*c with w2 = 1-w0-w1.
+     * Rewritten as b + w0*(c-b) + w1*(a-b) that is two multiplies instead
+     * of three, and w2 need not be computed at all. The differences are
+     * constant across the triangle, so they are hoisted here: this loop was
+     * 37% of all time spent inside QEMU during a timedemo.
+     */
+    const float dz_c = c->z - b->z,  dz_a = a->z - b->z;
+    const float dr_c = c->r - b->r,  dr_a = a->r - b->r;
+    const float dg_c = c->g - b->g,  dg_a = a->g - b->g;
+    const float db_c = c->b - b->b,  db_a = a->b - b->b;
+    const float da_c = c->a - b->a,  da_a = a->a - b->a;
+    const float ds_c = c->s - b->s,  ds_a = a->s - b->s;
+    const float dt_c = c->t - b->t,  dt_a = a->t - b->t;
+    const float ds2_c = c->s2 - b->s2, ds2_a = a->s2 - b->s2;
+    const float dt2_c = c->t2 - b->t2, dt2_a = a->t2 - b->t2;
+
     for (y = miny; y <= maxy; y++) {
         uint8_t *row = base + (size_t)y * pitch;
+        float py = y + 0.5f;
+        float w0_row = ((b->x - a->x) * (py - a->y) -
+                        (x0 - a->x) * (b->y - a->y)) * inv_area;
+        float w1_row = ((c->x - b->x) * (py - b->y) -
+                        (x0 - b->x) * (c->y - b->y)) * inv_area;
 
         if (row + (size_t)(maxx + 1) * 4 >
             s->vga.vram_ptr + s->vga.vram_size) {
             break;
         }
-        for (x = minx; x <= maxx; x++) {
-            float px = x + 0.5f, py = y + 0.5f;
-            float w0, w1, w2;
+        for (x = minx; x <= maxx; x++,
+             w0_row += w0_dx, w1_row += w1_dx) {
+            float w0 = w0_row, w1 = w1_row;
             uint32_t pix;
-
-            w0 = ((b->x - a->x) * (py - a->y) -
-                  (px - a->x) * (b->y - a->y)) / area;
-            w1 = ((c->x - b->x) * (py - b->y) -
-                  (px - b->x) * (c->y - b->y)) / area;
-            w2 = 1.0f - w0 - w1;
 
             float sr, sg, sb, sa;
 
-            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+            if (w0 < 0.0f || w1 < 0.0f || w0 + w1 > 1.0f) {
                 continue;
             }
 
@@ -1077,7 +1247,7 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
              * Interpolated with the same barycentrics as everything else.
              */
             if (zbuf.test || zbuf.write) {
-                float pz = w1 * a->z + w2 * b->z + w0 * c->z;
+                float pz = b->z + w0 * dz_c + w1 * dz_a;
 
                 if (!ati_3d_ztest(&zbuf, x, y, pz)) {
                     continue;
@@ -1085,10 +1255,10 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
             }
 
             /* w1 weights a, w2 weights b, w0 weights c */
-            sr = w1 * a->r + w2 * b->r + w0 * c->r;
-            sg = w1 * a->g + w2 * b->g + w0 * c->g;
-            sb = w1 * a->b + w2 * b->b + w0 * c->b;
-            sa = w1 * a->a + w2 * b->a + w0 * c->a;
+            sr = b->r + w0 * dr_c + w1 * dr_a;
+            sg = b->g + w0 * dg_c + w1 * dg_a;
+            sb = b->b + w0 * db_c + w1 * db_a;
+            sa = b->a + w0 * da_c + w1 * da_a;
 
             /*
              * Modulate by the texture. The combine mode in
@@ -1097,8 +1267,8 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
              * reduces to the texel alone when the vertex colour is white.
              */
             if (tex.valid) {
-                float ts = w1 * a->s + w2 * b->s + w0 * c->s;
-                float tt = w1 * a->t + w2 * b->t + w0 * c->t;
+                float ts = b->s + w0 * ds_c + w1 * ds_a;
+                float tt = b->t + w0 * dt_c + w1 * dt_a;
                 float tr, tg, tb, ta;
 
                 ati_3d_texel(&tex, ts, tt, &tr, &tg, &tb, &ta);
@@ -1117,12 +1287,10 @@ static void ati_3d_tri(ATIVGAState *s, const ATI3DVert *a,
              */
             if (use_sec) {
                 bool sec_st = (s->regs.sec_tex_cntl & SEC_SELECT_SEC_ST) != 0;
-                float ts2 = sec_st
-                    ? (w1 * a->s2 + w2 * b->s2 + w0 * c->s2)
-                    : (w1 * a->s + w2 * b->s + w0 * c->s);
-                float tt2 = sec_st
-                    ? (w1 * a->t2 + w2 * b->t2 + w0 * c->t2)
-                    : (w1 * a->t + w2 * b->t + w0 * c->t);
+                float ts2 = sec_st ? (b->s2 + w0 * ds2_c + w1 * ds2_a)
+                                   : (b->s + w0 * ds_c + w1 * ds_a);
+                float tt2 = sec_st ? (b->t2 + w0 * dt2_c + w1 * dt2_a)
+                                   : (b->t + w0 * dt_c + w1 * dt_a);
                 float tr2, tg2, tb2, ta2;
 
                 ati_3d_texel(&tex2, ts2, tt2, &tr2, &tg2, &tb2, &ta2);
@@ -1388,12 +1556,22 @@ static void ati_3d_draw(ATIVGAState *s, unsigned opcode,
         unsigned i;
 
         for (i = 0; i < nvtx; i++) {
-            uint32_t d = data[hdr + i / 2];
-            unsigned idx = (i & 1) ? (d & 0xffff) : (d >> 16);
+            uint32_t d;
+            unsigned idx;
 
             if (hdr + i / 2 >= count) {
                 return;
             }
+            d = data[hdr + i / 2];
+            /*
+             * First index in the LOW half. Measured over 7.9 million
+             * indexed triangles of Quake 3: high-half-first built 900444
+             * triangles with a repeated vertex (11.4%), low-half-first
+             * 6884 (0.09%). The wrong pairing took a corner of each
+             * triangle from its neighbour, which is what drew the long
+             * "projected" spikes through the scene. Matches Bochs.
+             */
+            idx = (i & 1) ? (d >> 16) : (d & 0xffff);
             if (bufsize && idx >= bufsize) {
                 return;
             }
@@ -1603,8 +1781,20 @@ static void ati_cce_dispatch_packet3(ATIVGAState *s, uint32_t header,
                          * to the GART instead, which is where textures
                          * actually come from.
                          */
-                        if (page != last_page &&
-                            !ati_addr_in_display_buffer(s, a)) {
+                        /*
+                         * Record every page, including ones inside a learned
+                         * display surface: a texture uploaded here is newer
+                         * than whatever blit taught us the region was a
+                         * framebuffer. Measured: in both runs of a Quake 3
+                         * session, textures at 0x696580, 0x6a6580,
+                         * 0x5e6b00... landed in regions an earlier blit had
+                         * claimed, and were sent to the GART - reading AGP
+                         * memory instead of the texels just written here. A
+                         * blit to the page afterwards clears the record
+                         * again (ati_2d_note_surface), so the most recent
+                         * writer decides.
+                         */
+                        if (page != last_page) {
                             ati_tex_loc_record(s, page, false);
                             last_page = page;
                         }
@@ -1628,7 +1818,7 @@ static void ati_cce_dispatch_packet3(ATIVGAState *s, uint32_t header,
                 qemu_log("ati_hostblt: dst=0x%x pitch=%u at (%u,%u) %ux%u "
                          "bypp=%u payload=%u  [tex_reg=0x%x]\n",
                          off, pitch, x, y, w, h, bypp, n,
-                         s->regs.prim_tex_offset);
+                         s->regs.prim_tex_offset[0]);
             }
         }
         break;
@@ -2044,6 +2234,18 @@ void ati_2d_note_surface(ATIVGAState *s, uint32_t off, unsigned pitch,
     if (w < 256 || h < 64 || !pitch) {
         return;
     }
+    {
+        /* This blit is now the newest writer of these pages. */
+        uint32_t p, end = off + pitch * h;
+
+        for (p = off & ~0xfffU; p < end; p += 0x1000) {
+            ATITexLoc *e = &s->tex_loc_cache[ati_tex_loc_hash(p)];
+
+            if (e->valid && e->page == p) {
+                e->valid = false;
+            }
+        }
+    }
     for (i = 0; i < ARRAY_SIZE(s->display_surf); i++) {
         if (s->display_surf[i].base == off) {
             return;                 /* already known */
@@ -2077,21 +2279,14 @@ static void ati_tex_loc_record(ATIVGAState *s, uint32_t page, bool in_gart)
     e->in_gart = in_gart;
 }
 
-/*
- * Returns true and sets *in_gart if this page's actual write location is
- * known; false if nothing has ever recorded a write there, in which case
- * the caller falls back to the GART-first heuristic.
- */
-static bool ati_tex_loc_lookup(ATIVGAState *s, uint32_t page, bool *in_gart)
+/* A host-data upload wrote this page, and no blit has written it since. */
+static bool ati_tex_uploaded_here(ATIVGAState *s, uint32_t page)
 {
     ATITexLoc *e = &s->tex_loc_cache[ati_tex_loc_hash(page)];
 
-    if (!e->valid || e->page != page) {
-        return false;
-    }
-    *in_gart = e->in_gart;
-    return true;
+    return e->valid && e->page == page && !e->in_gart;
 }
+
 
 /*
  * Execute an indirect command buffer.  Called when the guest writes

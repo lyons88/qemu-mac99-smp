@@ -261,8 +261,38 @@ static void ati_vga_vblank_irq(void *opaque)
 {
     ATIVGAState *s = opaque;
 
+    {
+        static int64_t last;
+        static unsigned n;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (n < 40) {
+            n++;
+            qemu_log("ati_vblank: t=%" PRId64 " delta=%" PRId64 " us "
+                     "status=0x%x cntl=0x%x\n",
+                     now, last ? (now - last) / 1000 : 0,
+                     s->regs.gen_int_status, s->regs.gen_int_cntl);
+        }
+        last = now;
+    }
+
     timer_mod(&s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 60);
+
+    /*
+     * Do not stack interrupts. If the previous vblank has not been
+     * acknowledged yet, leave the status alone rather than asserting
+     * again: real hardware raises one edge per frame, and re-raising on
+     * top of an unserviced interrupt turns a handler that is merely slow
+     * into a livelock - the guest acknowledges, a new interrupt is already
+     * pending on the next read, and it never returns to normal execution.
+     *
+     * Mac OS 9 with the ATI Resource Manager shows exactly that trace:
+     * write 0x44 <- 0x1 immediately followed by read 0x44 -> 0x1.
+     */
+    if (s->regs.gen_int_status & CRTC_VBLANK_INT) {
+        return;
+    }
     s->regs.gen_int_status |= CRTC_VBLANK_INT;
     ati_vga_update_irq(s);
 }
@@ -310,6 +340,70 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
                                 addr - (BIOS_0_SCRATCH + i * 4), size);
         break;
     }
+    case CLOCK_CNTL_INDEX:
+        val = s->regs.clock_cntl_index;
+        break;
+    case CLOCK_CNTL_DATA:
+        /*
+         * Indexed PLL window: CLOCK_CNTL_INDEX selects a PLL register and
+         * CLOCK_CNTL_DATA reads or writes it. Neither was implemented, so
+         * every PLL read returned 0 and Mac OS 9 spun selecting index 3
+         * (PPLL_REF_DIV) and reading back nothing.
+         */
+        val = s->regs.pll[s->regs.clock_cntl_index & 0x3f];
+        break;
+    case AMCGPIO_Y_MIR:
+        /*
+         * GPIO input mirror - the value sampled from the pins.
+         *
+         * This had no case at all, so it returned 0 on all 105310 reads
+         * of one boot: both I2C lines reading low, which on a real bus
+         * means somebody is holding it down. Mac OS 9 bit-bangs DDC here
+         * (211378 toggles of I2C_CNTL_1 in the same boot) and retries
+         * forever against a bus that never releases.
+         *
+         * Idle I2C is pulled HIGH. Report any line we are not actively
+         * driving low as high, so the guest sees a free bus, gets no
+         * acknowledge from a device that is not there, and concludes there
+         * is no monitor on this port instead of spinning.
+         */
+        val = (s->regs.amcgpio_a_mir & s->regs.amcgpio_en_mir) |
+              ~s->regs.amcgpio_en_mir;
+        break;
+    case AMCGPIO_A_MIR:
+        val = s->regs.amcgpio_a_mir;
+        break;
+    case AMCGPIO_EN_MIR:
+        val = s->regs.amcgpio_en_mir;
+        break;
+    case AMCGPIO_MASK_MIR:
+        val = s->regs.amcgpio_mask_mir;
+        break;
+    case I2C_CNTL_1:
+        /*
+         * I2C/DDC control. r128_reg.h documents the address but no bits
+         * (it is marked "?"), so this is behaviour-driven rather than
+         * decoded: Mac OS 9 writes 0x10000 - a go/start bit - then reads
+         * back waiting for the transaction to change state. Returning 0
+         * meant it never started and never finished, and the guest retried
+         * 211378 times in one boot while the Finder waited on display
+         * detection.
+         *
+         * We have no monitor on the far end, so hold the written value.
+         * The write-then-verify completes and the probe moves on to
+         * finding no device, rather than spinning forever.
+         */
+        val = s->regs.i2c_cntl_1;
+        break;
+    case FP_GEN_CNTL:
+        /*
+         * Flat panel control. Not previously implemented, so it read back
+         * as 0 and a write-then-verify never completed: Mac OS 9 wrote
+         * 0x200 and spun waiting to read it back. Plain storage is enough
+         * - nothing here drives real panel hardware.
+         */
+        val = s->regs.fp_gen_cntl;
+        break;
     case GEN_INT_CNTL:
         val = s->regs.gen_int_cntl;
         break;
@@ -416,6 +510,24 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
     case RBBM_STATUS:
     case GUI_STAT:
         val = 64; /* free CMDFIFO entries */
+        break;
+    case PC_GUI_CTLSTAT:
+    case PC_NGUI_CTLSTAT:
+        /*
+         * Pixel cache control/status. The guest sets PC_FLUSH_ALL (0xff)
+         * and then polls until PC_BUSY (bit 31) clears; we flush
+         * synchronously, so report the request bits back with PC_BUSY
+         * already low.
+         *
+         * Without a read case here this returned 0, so a flush looked as
+         * though it had never been accepted. Mac OS 9 with the ATI
+         * Resource Manager extension hangs on exactly this: the extension
+         * is what brings the CCE up, that path calls wait-for-idle ->
+         * pixcache flush, and the poll never completes. Booting without
+         * the extension never touches it, which is why only that
+         * configuration froze.
+         */
+        val = s->regs.pc_gui_ctlstat & ~PC_BUSY;
         break;
     case CRTC_H_TOTAL_DISP ... CRTC_H_TOTAL_DISP + 3:
         val = ati_reg_read_offs(s->regs.crtc_h_total_disp,
@@ -663,14 +775,55 @@ void ati_mm_write(void *opaque, hwaddr addr,
                            addr - (BIOS_0_SCRATCH + i * 4), data, size);
         break;
     }
+    case CLOCK_CNTL_INDEX:
+        s->regs.clock_cntl_index = data;
+        break;
+    case CLOCK_CNTL_DATA:
+        /* Bit 7 of the index is the write-enable strobe on this part. */
+        s->regs.pll[s->regs.clock_cntl_index & 0x3f] = data;
+        break;
+    case AMCGPIO_A_MIR:
+        s->regs.amcgpio_a_mir = data;
+        break;
+    case AMCGPIO_EN_MIR:
+        s->regs.amcgpio_en_mir = data;
+        break;
+    case AMCGPIO_MASK_MIR:
+        s->regs.amcgpio_mask_mir = data;
+        break;
+    case AMCGPIO_Y_MIR:
+        break;                  /* input only */
+    case I2C_CNTL_1:
+        s->regs.i2c_cntl_1 = data;
+        break;
+    case FP_GEN_CNTL:
+        s->regs.fp_gen_cntl = data;
+        break;
     case GEN_INT_CNTL:
         s->regs.gen_int_cntl = data;
+        /*
+         * Arm on bit 0. The guest only ever writes 0x1 and 0x401 here, so
+         * requiring R128_VSYNC_INT (bit 2) meant the timer never started:
+         * no vblank interrupts at all, which stops the Mac OS 9 clock and
+         * freezes the cursor while the rest of the system keeps running.
+         */
         if (data & CRTC_VBLANK_INT) {
-            ati_vga_vblank_irq(s);
+            /*
+             * Arm the timer only - do NOT call ati_vga_vblank_irq() here.
+             * That raises the status bit and asserts the line immediately,
+             * so enabling interrupts synthesised one on the spot. A driver
+             * that re-enables inside its handler then took another at
+             * once, and Mac OS 9 spun in its interrupt handler forever:
+             * the acknowledge looked as though it never worked, because a
+             * fresh interrupt arrived before the next read.
+             */
+            timer_mod(&s->vblank_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NANOSECONDS_PER_SECOND / 60);
         } else {
             timer_del(&s->vblank_timer);
-            ati_vga_update_irq(s);
         }
+        ati_vga_update_irq(s);
         break;
     case GEN_INT_STATUS:
         data &= (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
@@ -1123,8 +1276,14 @@ void ati_mm_write(void *opaque, hwaddr addr,
     case TEX_SIZE_PITCH_C:
         s->regs.tex_size_pitch = data;
         break;
-    case PRIM_TEX_0_OFFSET_C:
-        s->regs.prim_tex_offset = data;
+    case PRIM_TEX_0_OFFSET_C ... PRIM_TEX_0_OFFSET_C + 10 * 4:
+        /*
+         * Eleven consecutive mip-level offsets. The driver bursts all of
+         * them in one packet0 write (CCE_PACKET0 with count
+         * 2 + R128_MAX_TEXTURE_LEVELS), so they arrive as a run of
+         * auto-incrementing register writes.
+         */
+        s->regs.prim_tex_offset[(addr - PRIM_TEX_0_OFFSET_C) / 4] = data;
         break;
     case MISC_3D_STATE_CNTL_REG_C:
         s->regs.misc_3d_state = data;
@@ -1144,8 +1303,13 @@ void ati_mm_write(void *opaque, hwaddr addr,
     case SEC_TEX_COMBINE_CNTL_C:
         s->regs.sec_tex_combine = data;
         break;
-    case SEC_TEX_0_OFFSET_C:
-        s->regs.sec_tex_offset = data;
+    case SEC_TEX_0_OFFSET_C ... SEC_TEX_0_OFFSET_C + 10 * 4:
+        s->regs.sec_tex_offset[(addr - SEC_TEX_0_OFFSET_C) / 4] = data;
+        break;
+    case PC_GUI_CTLSTAT:
+    case PC_NGUI_CTLSTAT:
+        /* Flush requests complete immediately; keep the bits, drop BUSY. */
+        s->regs.pc_gui_ctlstat = data & ~PC_BUSY;
         break;
     case SETUP_CNTL:
         s->regs.setup_cntl = data;
@@ -1227,6 +1391,29 @@ void ati_mm_write(void *opaque, hwaddr addr,
         s->cce.buffer_offset = data & 0x03fffff0;
         break;
     case PM4_BUFFER_CNTL:
+        /*
+         * Writing 0 disables the command engine. The driver does this every
+         * time an application sets up a GL context (0x78000000, 0, then
+         * 0x78000000 again), so it is the point where one app's view of
+         * video memory stops being valid.
+         *
+         * Forget everything that describes VRAM contents at that point: the
+         * texture-location cache and the learned display surfaces both
+         * survived an app quitting, so a relaunched game - which gets its
+         * surfaces and textures at different addresses - was sampled
+         * against the previous run's layout. That is why Quake 3 rendered
+         * correctly the first time and had broken menus and cinematics the
+         * second. Also drop any half-decoded FIFO packet, so the new
+         * context's first packet is not read as the tail of an old one.
+         */
+        if (data == 0 && s->cce.buffer_cntl != 0) {
+            memset(s->tex_loc_cache, 0, sizeof(s->tex_loc_cache));
+            memset(s->display_surf, 0, sizeof(s->display_surf));
+            s->display_surf_next = 0;
+            s->cce.fifo.remaining = 0;
+            s->cce.fifo.index = 0;
+            s->cce.fifo.hdr = 0;
+        }
         s->cce.buffer_cntl = data;
         break;
     case PM4_BUFFER_DL_RPTR:

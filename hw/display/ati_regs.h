@@ -33,6 +33,7 @@
 #define BIOS_0_SCRATCH                          0x0010
 #define BUS_CNTL                                0x0030
 #define BUS_CNTL1                               0x0034
+#define FP_GEN_CNTL                             0x0284
 #define GEN_INT_CNTL                            0x0040
 #define GEN_INT_STATUS                          0x0044
 #define CRTC_GEN_CNTL                           0x0050
@@ -412,6 +413,15 @@
 
 /* GEN_INT_CNTL) */
 #define CRTC_VBLANK_INT                         0x00000001
+/*
+ * Rage 128 puts the vsync interrupt at bit 2 in both GEN_INT_CNTL and
+ * GEN_INT_STATUS (R128_VSYNC_INT / R128_VSYNC_INT_AK = 1 << 2). Bit 0 is
+ * the Radeon layout. Raising bit 0 meant the guest's handler acknowledged
+ * bit 2, the bit we had set never cleared, and the interrupt line stayed
+ * asserted - Mac OS 9 with the ATI Resource Manager extension spun in its
+ * interrupt handler forever and never reached the desktop.
+ */
+#define R128_VSYNC_INT                          0x00000004
 #define CRTC_VLINE_INT                          0x00000002
 #define CRTC_VSYNC_INT                          0x00000004
 
